@@ -112,6 +112,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhase do
     zero_version = Version.zero()
 
     cond do
+      is_nil(oldest) or is_nil(newest) -> false
       oldest == zero_version -> true
       newest == zero_version -> false
       true -> newest >= oldest

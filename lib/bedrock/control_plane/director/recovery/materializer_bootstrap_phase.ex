@@ -37,7 +37,6 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   alias Bedrock.ControlPlane.Director.Recovery.CommitProxyStartupPhase
   alias Bedrock.DataPlane.Materializer
   alias Bedrock.Service.Foreman
-  alias Bedrock.Service.Worker
 
   require Logger
 
@@ -128,6 +127,13 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
     end)
   end
 
+  defp ensure_recovered_shard_layout(shard_layout) when map_size(shard_layout) == 0 do
+    Logger.warning("Recovered shard layout is empty, using the default shard layout")
+    default_shard_layout()
+  end
+
+  defp ensure_recovered_shard_layout(shard_layout), do: shard_layout
+
   # Create materializers for multiple shards
   defp create_materializers_for_shards(shard_tags, recovery_attempt, context) do
     Enum.reduce_while(shard_tags, {:ok, %{}}, fn shard_tag, {:ok, acc} ->
@@ -155,7 +161,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   # Create worker via Foreman for a specific shard
   defp create_materializer_worker(node, shard_tag, recovery_attempt, context) do
     foreman_ref = {recovery_attempt.cluster.otp_name(:foreman), node}
-    worker_id = Worker.random_id()
+    worker_id = materializer_worker_id(shard_tag)
     create_worker_fn = Map.get(context, :create_worker_fn, &Foreman.new_worker/4)
 
     case create_worker_fn.(foreman_ref, worker_id, :materializer, timeout: 30_000) do
@@ -206,7 +212,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
     with {:ok, materializer_pid} <-
            recover_existing_shard_materializer(system_shard, recovery_attempt, context, read_version),
          # Step 6: Query shard layout
-         {:ok, shard_layout} <- get_shard_layout(materializer_pid, read_version, context),
+         {:ok, recovered_shard_layout} <- get_shard_layout(materializer_pid, read_version, context),
+         shard_layout = ensure_recovered_shard_layout(recovered_shard_layout),
          # Step 7: Recover every shard materializer required by the layout
          {:ok, shard_materializers} <-
            recover_existing_shard_materializers(
@@ -259,17 +266,21 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
       {_id, service} ->
         {:ok, service}
 
-      nil when shard_tag == 0 ->
-        # Fall back to legacy string-key lookup for backward compatibility
-        case Map.get(services, "metadata_materializer") do
-          nil -> {:error, {:materializer_unavailable, :not_in_available_services}}
-          service -> {:ok, service}
-        end
-
       nil ->
-        {:error, {:materializer_unavailable, :not_in_available_services}}
+        find_materializer_by_stable_id(services, shard_tag)
     end
   end
+
+  defp find_materializer_by_stable_id(services, shard_tag) do
+    case Map.get(services, materializer_worker_id(shard_tag)) do
+      {:materializer, _ref} = service -> {:ok, service}
+      {:materializer, _ref, ^shard_tag} = service -> {:ok, service}
+      _ -> {:error, {:materializer_unavailable, :not_in_available_services}}
+    end
+  end
+
+  defp materializer_worker_id(0), do: "metadata_materializer"
+  defp materializer_worker_id(shard_tag), do: "materializer_shard_#{shard_tag}"
 
   defp create_materializer(recovery_attempt, context, shard_tag) do
     with {:ok, node} <- find_materializer_capable_node(context),
