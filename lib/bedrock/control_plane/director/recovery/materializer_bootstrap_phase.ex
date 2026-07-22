@@ -37,7 +37,6 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   alias Bedrock.ControlPlane.Director.Recovery.CommitProxyStartupPhase
   alias Bedrock.DataPlane.Materializer
   alias Bedrock.Service.Foreman
-  alias Bedrock.Service.Worker
 
   require Logger
 
@@ -162,7 +161,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   # Create worker via Foreman for a specific shard
   defp create_materializer_worker(node, shard_tag, recovery_attempt, context) do
     foreman_ref = {recovery_attempt.cluster.otp_name(:foreman), node}
-    worker_id = Worker.random_id()
+    worker_id = materializer_worker_id(shard_tag)
     create_worker_fn = Map.get(context, :create_worker_fn, &Foreman.new_worker/4)
 
     case create_worker_fn.(foreman_ref, worker_id, :materializer, timeout: 30_000) do
@@ -267,17 +266,21 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
       {_id, service} ->
         {:ok, service}
 
-      nil when shard_tag == 0 ->
-        # Fall back to legacy string-key lookup for backward compatibility
-        case Map.get(services, "metadata_materializer") do
-          nil -> {:error, {:materializer_unavailable, :not_in_available_services}}
-          service -> {:ok, service}
-        end
-
       nil ->
-        {:error, {:materializer_unavailable, :not_in_available_services}}
+        find_materializer_by_stable_id(services, shard_tag)
     end
   end
+
+  defp find_materializer_by_stable_id(services, shard_tag) do
+    case Map.get(services, materializer_worker_id(shard_tag)) do
+      {:materializer, _ref} = service -> {:ok, service}
+      {:materializer, _ref, ^shard_tag} = service -> {:ok, service}
+      _ -> {:error, {:materializer_unavailable, :not_in_available_services}}
+    end
+  end
+
+  defp materializer_worker_id(0), do: "metadata_materializer"
+  defp materializer_worker_id(shard_tag), do: "materializer_shard_#{shard_tag}"
 
   defp create_materializer(recovery_attempt, context, shard_tag) do
     with {:ok, node} <- find_materializer_capable_node(context),

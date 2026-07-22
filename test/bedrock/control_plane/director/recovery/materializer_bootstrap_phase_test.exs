@@ -33,7 +33,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
           }
         ]
         |> create_test_context()
-        |> Map.put(:create_worker_fn, fn _foreman_ref, _worker_id, :materializer, _opts ->
+        |> Map.put(:create_worker_fn, fn _foreman_ref, worker_id, :materializer, _opts ->
+          :ets.insert(created_shards, {:worker_id, worker_id})
           {:ok, :new_materializer_ref}
         end)
         |> Map.put(:lock_materializer_fn, fn {:materializer, _ref, shard_tag}, _epoch ->
@@ -71,6 +72,10 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
       shards = created_shards |> :ets.lookup(:shard) |> Enum.map(fn {:shard, tag} -> tag end)
       assert 0 in shards
       assert 1 in shards
+
+      worker_ids = created_shards |> :ets.lookup(:worker_id) |> Enum.map(fn {:worker_id, id} -> id end)
+      assert "metadata_materializer" in worker_ids
+      assert "materializer_shard_1" in worker_ids
 
       :ets.delete(created_shards)
     end
@@ -263,6 +268,49 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         end)
 
       assert log =~ "Materializer caught up to version"
+    end
+
+    test "reuses stable materializer service ids after a recovery retry" do
+      system_materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      user_materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      durable_version = Version.from_integer(100)
+
+      recovery_attempt =
+        recovery_attempt()
+        |> Map.put(:metadata_materializer, nil)
+        |> Map.put(:shard_layout, nil)
+        |> Map.put(:logs, %{"log_1" => [0, 1]})
+        |> Map.put(:durable_version, durable_version)
+
+      context =
+        [old_transaction_system_layout: %{logs: %{"log_1" => [0, 1]}}]
+        |> create_test_context()
+        |> Map.put(:available_services, %{
+          "metadata_materializer" => {:materializer, {:system_materializer, node()}},
+          "materializer_shard_1" => {:materializer, {:user_materializer, node()}}
+        })
+        |> Map.put(:create_worker_fn, fn _foreman_ref, _worker_id, :materializer, _opts ->
+          flunk("stable materializers should be reused")
+        end)
+        |> Map.put(:lock_materializer_fn, fn
+          {:materializer, {:system_materializer, _node}}, _epoch -> {:ok, system_materializer_pid}
+          {:materializer, {:user_materializer, _node}}, _epoch -> {:ok, user_materializer_pid}
+        end)
+        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
+        |> Map.put(:materializer_info_fn, fn _pid, [:current_version] ->
+          {:ok, %{current_version: durable_version}}
+        end)
+        |> Map.put(:get_shard_layout_fn, fn ^system_materializer_pid, _version ->
+          {:ok, %{<<0xFF>> => {0, <<>>}, Bedrock.end_of_keyspace() => {1, <<0xFF>>}}}
+        end)
+
+      assert {updated_attempt, CommitProxyStartupPhase} =
+               MaterializerBootstrapPhase.execute(recovery_attempt, context)
+
+      assert updated_attempt.shard_materializers == %{
+               0 => system_materializer_pid,
+               1 => user_materializer_pid
+             }
     end
 
     test "existing cluster recovers materializers for every shard in the recovered layout" do
