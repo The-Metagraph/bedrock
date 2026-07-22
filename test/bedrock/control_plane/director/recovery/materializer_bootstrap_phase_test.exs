@@ -328,6 +328,60 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
       :ets.delete(unlocks)
     end
 
+    test "existing cluster restores the default layout when shard metadata was not persisted" do
+      system_materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      user_materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      version = Version.zero()
+
+      recovery_attempt =
+        recovery_attempt()
+        |> Map.put(:metadata_materializer, nil)
+        |> Map.put(:shard_layout, nil)
+        |> Map.put(:logs, %{"log_1" => []})
+        |> Map.put(:durable_version, version)
+        |> Map.put(:version_vector, {version, version})
+
+      context =
+        [
+          old_transaction_system_layout: %{logs: %{"log_1" => []}},
+          node_capabilities: %{
+            log: [Node.self()],
+            materializer: [Node.self()]
+          }
+        ]
+        |> create_test_context()
+        |> Map.put(:available_services, %{})
+        |> Map.put(:create_worker_fn, fn _foreman_ref, _worker_id, :materializer, _opts ->
+          {:ok, :new_materializer_ref}
+        end)
+        |> Map.put(:lock_materializer_fn, fn
+          {:materializer, _ref, 0}, _epoch -> {:ok, system_materializer_pid}
+          {:materializer, _ref, 1}, _epoch -> {:ok, user_materializer_pid}
+        end)
+        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
+        |> Map.put(:materializer_info_fn, fn _pid, [:current_version] ->
+          {:ok, %{current_version: version}}
+        end)
+        |> Map.put(:get_shard_layout_fn, fn ^system_materializer_pid, ^version -> {:ok, %{}} end)
+
+      log =
+        capture_log(fn ->
+          assert {updated_attempt, CommitProxyStartupPhase} =
+                   MaterializerBootstrapPhase.execute(recovery_attempt, context)
+
+          assert updated_attempt.shard_layout == MaterializerBootstrapPhase.default_shard_layout()
+
+          assert updated_attempt.shard_materializers == %{
+                   0 => system_materializer_pid,
+                   1 => user_materializer_pid
+                 }
+
+          assert updated_attempt.resolvers |> Enum.map(& &1.start_key) |> Enum.sort() == [<<>>, <<0xFF>>]
+        end)
+
+      assert log =~ "Recovered shard layout is empty"
+    end
+
     test "creates new materializer when not found but capable nodes exist" do
       materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
       durable_version = Version.from_integer(100)

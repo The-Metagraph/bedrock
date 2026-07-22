@@ -353,7 +353,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
 
       {:ok, [active_segment | segments]} ->
         active_segment = Segment.ensure_transactions_are_loaded(active_segment)
-        last_version = Segment.last_version(active_segment)
+        last_version = Segment.last_version(active_segment) || active_segment.min_version
         oldest_version = Enum.min([active_segment.min_version | Enum.map(segments, & &1.min_version)])
         {:ok, {oldest_version, last_version, active_segment, segments}}
 

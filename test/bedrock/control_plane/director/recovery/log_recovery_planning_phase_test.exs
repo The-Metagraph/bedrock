@@ -198,7 +198,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhaseTest do
 
       invalid_ranges = [
         {Version.from_integer(50), Version.from_integer(10)},
-        {Version.from_integer(10), Version.zero()}
+        {Version.from_integer(10), Version.zero()},
+        {Version.zero(), nil}
       ]
 
       Enum.each(valid_ranges, fn range ->

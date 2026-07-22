@@ -20,10 +20,12 @@ defmodule Bedrock.DataPlane.Log.Shale.PullBoundaryTest do
     File.mkdir_p!(path)
 
     # Start the Shale server
+    server_args = {cluster, otp_name, id, foreman, path, object_storage, true}
+
     {:ok, pid} =
       GenServer.start_link(
         Server,
-        {cluster, otp_name, id, foreman, path, object_storage, true},
+        server_args,
         name: otp_name
       )
 
@@ -33,7 +35,7 @@ defmodule Bedrock.DataPlane.Log.Shale.PullBoundaryTest do
       end
     end)
 
-    {:ok, log: pid, path: path}
+    {:ok, log: pid, path: path, otp_name: otp_name, server_args: server_args}
   end
 
   describe "empty log pull boundary conditions" do
@@ -61,6 +63,24 @@ defmodule Bedrock.DataPlane.Log.Shale.PullBoundaryTest do
       # Verify the log can provide info without crashing and returns expected structure
       assert {:ok, %{last_version: <<0, 0, 0, 0, 0, 0, 0, 0>>, oldest_version: _}} =
                Log.info(log, [:last_version, :oldest_version])
+    end
+
+    test "restores version zero after restarting an empty persisted log", %{
+      log: log,
+      otp_name: otp_name,
+      server_args: server_args
+    } do
+      GenServer.stop(log)
+      {:ok, restarted_log} = GenServer.start_link(Server, server_args, name: otp_name)
+
+      on_exit(fn ->
+        if Process.alive?(restarted_log), do: GenServer.stop(restarted_log)
+      end)
+
+      assert {:ok, %{last_version: version, oldest_version: version}} =
+               Log.info(restarted_log, [:last_version, :oldest_version])
+
+      assert version == Version.zero()
     end
   end
 end
