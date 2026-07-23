@@ -89,6 +89,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
         context \\ %{}
       ) do
     copy_log_data_fn = Map.get(context, :copy_log_data_fn, &copy_log_data/5)
+    replay_timeout = Map.get(context, :replay_timeout, :infinity)
     service_pids = recovery_attempt.service_pids
     replay_target_log_ids = replay_target_log_ids(new_log_ids, survivor_log_ids)
 
@@ -105,7 +106,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
       end,
       ordered: false,
       zip_input_on_exit: true,
-      timeout: 30_000
+      timeout: replay_timeout,
+      on_timeout: :kill_task
     )
     |> Enum.reduce_while(%{}, fn
       {:ok, {_, {:error, :newer_epoch_exists} = error}}, _ ->

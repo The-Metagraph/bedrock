@@ -369,9 +369,13 @@ defmodule Bedrock.ControlPlane.Director.RecoveryTest do
           {:materializer, {_worker_ref, _node}, 1}, _epoch -> {:ok, user_materializer_pid}
         end)
         |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
-        |> Map.put(:materializer_info_fn, fn pid, [:durable_version]
-                                             when pid in [materializer_pid, user_materializer_pid] ->
-          {:ok, %{durable_version: durable_version}}
+        |> Map.put(:materializer_info_fn, fn pid, [version_fact]
+                                             when pid in [materializer_pid, user_materializer_pid] and
+                                                    version_fact in [
+                                                      :durable_version,
+                                                      :current_version
+                                                    ] ->
+          {:ok, %{version_fact => durable_version}}
         end)
         |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
           {:ok, %{<<0xFF>> => {0, <<>>}, Bedrock.end_of_keyspace() => {1, <<0xFF>>}}}

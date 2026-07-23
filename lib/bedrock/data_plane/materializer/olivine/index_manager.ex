@@ -178,12 +178,18 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
   Uses a two-pass approach: first collect all instructions, then process each page.
   """
   @spec apply_transaction(t(), binary(), Database.t()) :: {t(), Database.t()}
-  def apply_transaction(
-        %{versions: [{_version, {current_index, _prev_modified}} | _]} = index_manager,
-        transaction,
-        database
-      ) do
+  def apply_transaction(%{current_version: current_version} = index_manager, transaction, database) do
     commit_version = Transaction.commit_version!(transaction)
+
+    if Version.newer?(commit_version, current_version) do
+      apply_new_transaction(index_manager, transaction, commit_version, database)
+    else
+      {index_manager, database}
+    end
+  end
+
+  defp apply_new_transaction(index_manager, transaction, commit_version, database) do
+    %{versions: [{_version, {current_index, _prev_modified}} | _]} = index_manager
 
     update =
       current_index

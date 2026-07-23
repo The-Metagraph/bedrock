@@ -19,10 +19,14 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   2. If not found, create a new materializer on a capable node
   3. Lock materializer for recovery
   4. Unlock it with system shard logs to start pulling
-  5. Wait for materializer to catch up to its durable baseline (60s timeout)
+  5. Wait for the materializer to catch up to its durable baseline
   6. Poll shard layout reads from persisted `\\xff/system/shards/*` metadata until the
      recovered layout version is actually readable
   7. Recover materializers for every shard tag in the layout
+
+  Recovery waits are unbounded by default because restarting a slow recovery discards
+  useful progress. Tests and callers may still provide explicit catch-up and shard-layout
+  timeouts through the recovery context.
 
   Stalls if the materializer is unavailable and cannot be created, or if catchup
   times out. Transitions to CommitProxyStartupPhase with the materializer pid and
@@ -44,10 +48,10 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   require Logger
 
-  # Catchup timeout: 60 seconds before stalling and retrying
-  @catchup_timeout_ms 60_000
+  @default_recovery_timeout :infinity
   @catchup_poll_interval_ms 500
   @shard_layout_read_timeout_ms 5_000
+  @transient_shard_layout_errors [:timeout, :version_too_new, :waiting_timeout]
 
   @impl true
   def execute(%RecoveryAttempt{} = recovery_attempt, context) do
@@ -225,6 +229,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   defp ensure_shard_materializers(recovery_attempt, metadata_materializer_pid, context) do
     system_shard = RecoveryAttempt.system_shard_id()
+    {_oldest_version, read_version} = recovery_attempt.version_vector
 
     recovery_attempt.shard_layout
     |> extract_shard_tags()
@@ -242,7 +247,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
                  recovery_attempt.durable_version,
                  context
                ),
-             :ok <- wait_for_materializer_catchup(materializer_pid, recovery_attempt.durable_version, context) do
+             :ok <- wait_for_materializer_catchup(materializer_pid, :current_version, read_version, context) do
           {:cont, {:ok, Map.put(acc, shard_tag, materializer_pid)}}
         else
           {:error, reason} ->
@@ -381,29 +386,35 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   # Poll until materializer reaches target version
   defp wait_for_materializer_catchup(pid, target_version, context) do
-    timeout_ms = Map.get(context, :catchup_timeout_ms, @catchup_timeout_ms)
-    poll_interval_ms = Map.get(context, :catchup_poll_interval_ms, @catchup_poll_interval_ms)
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-    do_wait_for_catchup(pid, target_version, deadline, poll_interval_ms, context)
+    wait_for_materializer_catchup(pid, :durable_version, target_version, context)
   end
 
-  defp do_wait_for_catchup(pid, target_version, deadline, poll_interval_ms, context) do
-    if System.monotonic_time(:millisecond) > deadline do
+  defp wait_for_materializer_catchup(pid, version_fact, target_version, context) do
+    timeout_ms = Map.get(context, :catchup_timeout_ms, @default_recovery_timeout)
+    poll_interval_ms = Map.get(context, :catchup_poll_interval_ms, @catchup_poll_interval_ms)
+    deadline = recovery_deadline(timeout_ms)
+
+    do_wait_for_catchup(pid, version_fact, target_version, deadline, poll_interval_ms, context)
+  end
+
+  defp do_wait_for_catchup(pid, version_fact, target_version, deadline, poll_interval_ms, context) do
+    if recovery_deadline_reached?(deadline) do
       {:error, :catchup_timeout}
     else
       info_fn = Map.get(context, :materializer_info_fn, &default_materializer_info/2)
 
-      case info_fn.(pid, [:durable_version]) do
-        {:ok, %{durable_version: v}} when v >= target_version ->
-          Logger.debug("Materializer caught up to version #{inspect(v)}")
+      case info_fn.(pid, [version_fact]) do
+        {:ok, %{^version_fact => v}} when v >= target_version ->
+          Logger.debug("Materializer caught up to version #{inspect(v)} (#{version_fact})")
           :ok
 
-        {:ok, %{durable_version: v}} ->
-          Logger.debug("Materializer at version #{inspect(v)}, waiting for #{inspect(target_version)}")
+        {:ok, %{^version_fact => v}} ->
+          Logger.debug(
+            "Materializer at version #{inspect(v)} (#{version_fact}), waiting for #{inspect(target_version)}"
+          )
 
           Process.sleep(poll_interval_ms)
-          do_wait_for_catchup(pid, target_version, deadline, poll_interval_ms, context)
+          do_wait_for_catchup(pid, version_fact, target_version, deadline, poll_interval_ms, context)
 
         {:error, reason} ->
           {:error, {:catchup_info_failed, reason}}
@@ -440,16 +451,16 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   end
 
   defp get_shard_layout(materializer_pid, read_version, context) do
-    timeout_ms = Map.get(context, :shard_layout_timeout_ms, @catchup_timeout_ms)
+    timeout_ms = Map.get(context, :shard_layout_timeout_ms, @default_recovery_timeout)
     poll_interval_ms = Map.get(context, :shard_layout_poll_interval_ms, @catchup_poll_interval_ms)
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    deadline = recovery_deadline(timeout_ms)
     get_layout_fn = Map.get(context, :get_shard_layout_fn, &default_get_shard_layout/2)
 
     do_get_shard_layout(materializer_pid, read_version, get_layout_fn, deadline, poll_interval_ms)
   end
 
   defp do_get_shard_layout(materializer_pid, read_version, get_layout_fn, deadline, poll_interval_ms) do
-    if System.monotonic_time(:millisecond) > deadline do
+    if recovery_deadline_reached?(deadline) do
       {:error, :shard_layout_timeout}
     else
       case get_layout_fn.(materializer_pid, read_version) do
@@ -460,7 +471,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
           Logger.warning("Recovered shard layout is empty, using the default shard layout")
           {:ok, default_shard_layout()}
 
-        {:error, reason} when reason in [:timeout, :version_too_new] ->
+        {:error, reason} when reason in @transient_shard_layout_errors ->
           Process.sleep(poll_interval_ms)
           do_get_shard_layout(materializer_pid, read_version, get_layout_fn, deadline, poll_interval_ms)
 
@@ -476,6 +487,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
       end
     end
   end
+
+  defp recovery_deadline(:infinity), do: :infinity
+  defp recovery_deadline(timeout_ms), do: System.monotonic_time(:millisecond) + timeout_ms
+
+  defp recovery_deadline_reached?(:infinity), do: false
+  defp recovery_deadline_reached?(deadline), do: System.monotonic_time(:millisecond) > deadline
 
   defp default_get_shard_layout(materializer_pid, read_version) do
     with {:ok, {metadata_entries, _more}} <- get_range(materializer_pid, SystemKeys.shards_prefix(), read_version),

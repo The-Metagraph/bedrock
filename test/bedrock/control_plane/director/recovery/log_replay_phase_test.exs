@@ -97,6 +97,25 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhaseTest do
       refute_received {:copy_called, "survivor", _}
     end
 
+    test "returns a structured failure when an explicit replay timeout is reached" do
+      new_log_id = "slow-new-log"
+      recovery_attempt = %{service_pids: %{new_log_id => self()}}
+
+      copy_log_data_fn = fn _new_log_id, _survivor_pids, _first_version, _last_version, _service_pids ->
+        Process.sleep(50)
+        {:ok, self()}
+      end
+
+      assert {:error, {:failed_to_copy_some_logs, %{^new_log_id => :timeout}}} =
+               LogReplayPhase.replay_into_new_logs(
+                 [],
+                 [new_log_id],
+                 {Version.from_integer(0), Version.from_integer(0)},
+                 recovery_attempt,
+                 %{copy_log_data_fn: copy_log_data_fn, replay_timeout: 10}
+               )
+    end
+
     # Note: Tests that call Log.recover_from are commented out since
     # they require proper log process mocking which is complex in unit tests
     # The function's core logic is tested through the pair_with_old_log_ids tests
