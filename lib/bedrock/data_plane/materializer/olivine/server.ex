@@ -22,6 +22,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   @continuation_batch_count 5
   # Larger batches during lulls when no reads are waiting
   @timeout_batch_count 50
+  @default_read_wait_ms 1_000
+  @read_reply_safety_ms 50
 
   @spec child_spec(opts :: keyword()) :: map()
   def child_spec(opts) do
@@ -71,7 +73,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
         context,
         key,
         version,
-        Keyword.put_new(fetch_opts, :wait_ms, 1_000)
+        Keyword.put_new(fetch_opts, :wait_ms, read_wait_ms(opts))
       )
 
     updated_state = %{t | read_request_manager: updated_manager}
@@ -96,7 +98,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
         start_key,
         end_key,
         version,
-        Keyword.put_new(fetch_opts, :wait_ms, 1_000)
+        Keyword.put_new(fetch_opts, :wait_ms, read_wait_ms(opts))
       )
 
     updated_state = %{t | read_request_manager: updated_manager}
@@ -215,6 +217,19 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     context = Reading.ReadingContext.new(state.index_manager, state.database)
     updated_manager = Reading.notify_waiting_fetches(state.read_request_manager, context, version)
     %{state | read_request_manager: updated_manager}
+  end
+
+  defp read_wait_ms(opts) do
+    case Keyword.get(opts, :timeout) do
+      timeout when is_integer(timeout) and timeout > @read_reply_safety_ms ->
+        timeout - @read_reply_safety_ms
+
+      timeout when is_integer(timeout) and timeout > 1 ->
+        timeout - 1
+
+      _timeout ->
+        @default_read_wait_ms
+    end
   end
 
   defp expire_waiting_fetches(state) do

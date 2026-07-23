@@ -9,6 +9,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.GenServerIntegrationTest do
 
   alias Bedrock.DataPlane.Materializer
   alias Bedrock.DataPlane.Materializer.Olivine
+  alias Bedrock.DataPlane.Transaction
   alias Bedrock.DataPlane.Version
 
   @timeout 10_000
@@ -326,6 +327,37 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.GenServerIntegrationTest do
                {{:waitlist_timing, _key}, _value} -> true
                _ -> false
              end)
+    end
+
+    @tag :tmp_dir
+    test "read timeout extends the materializer waitlist window", %{tmp_dir: tmp_dir} do
+      {_worker_id, _otp_name, pid} = setup_supervised_worker(tmp_dir, "caller_timeout")
+      future_version = Version.from_integer(1)
+
+      assert :ok =
+               GenServer.call(
+                 pid,
+                 {:unlock_after_recovery, Version.zero(), %{logs: %{}, services: %{}}},
+                 @timeout
+               )
+
+      transaction =
+        Transaction.encode(%{
+          mutations: [{:set, "key1", "value1"}],
+          commit_version: future_version
+        })
+
+      Task.start(fn ->
+        Process.sleep(1_100)
+        send(pid, {:apply_transactions, [transaction]})
+      end)
+
+      assert {:ok, "value1"} =
+               GenServer.call(
+                 pid,
+                 {:get, "key1", future_version, [timeout: 2_000]},
+                 2_500
+               )
     end
 
     @tag :tmp_dir
