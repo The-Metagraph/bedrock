@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Bound Shale restart synchronization to recovery segments.** Ordinary live
+  log pushes still synchronize the WAL before acknowledgement. Log-to-log
+  recovery now writes unchanged transactions with deferred durability, syncs
+  each dirty full segment before closing it, and syncs the final dirty segment
+  before the target becomes running. Failed barriers leave the target locked
+  and partial output is recycled before another source is tried.
+
 ## 0.5.1 — 2026-07-11
 
 - **Fix materializer recovery on fresh clusters.** Fresh Bedrock 0.5 layouts use empty log descriptors because shard-to-log routing is computed at runtime, but recovery still filtered materializer unlock logs by shard tag — so an empty descriptor matched no shard and fresh-cluster materializers started with no logs to pull committed transactions from. Recovery now treats empty log descriptors as runtime-routed logs, while legacy tag-filtered descriptors remain scoped to their matching shard.

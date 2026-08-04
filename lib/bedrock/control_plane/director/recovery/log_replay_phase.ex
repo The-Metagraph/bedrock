@@ -89,13 +89,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
         context \\ %{}
       ) do
     copy_log_data_fn = Map.get(context, :copy_log_data_fn, &copy_log_data/5)
+    replay_timeout = Map.get(context, :replay_timeout, :infinity)
     service_pids = recovery_attempt.service_pids
+    replay_target_log_ids = replay_target_log_ids(new_log_ids, survivor_log_ids)
 
     # Build list of survivor PIDs from their IDs
     survivor_pids = Enum.map(survivor_log_ids, &Map.get(service_pids, &1))
     survivor_pids = Enum.reject(survivor_pids, &is_nil/1)
 
-    new_log_ids
+    replay_target_log_ids
     |> Task.async_stream(
       fn new_log_id ->
         new_log_id
@@ -104,7 +106,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
       end,
       ordered: false,
       zip_input_on_exit: true,
-      timeout: 30_000
+      timeout: replay_timeout,
+      on_timeout: :kill_task
     )
     |> Enum.reduce_while(%{}, fn
       {:ok, {_, {:error, :newer_epoch_exists} = error}}, _ ->
@@ -123,6 +126,11 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
       failures when failures == %{} -> :ok
       failures -> {:error, {:failed_to_copy_some_logs, failures}}
     end
+  end
+
+  defp replay_target_log_ids(new_log_ids, survivor_log_ids) do
+    survivor_log_ids = MapSet.new(survivor_log_ids)
+    Enum.reject(new_log_ids, &MapSet.member?(survivor_log_ids, &1))
   end
 
   # Backward compatibility: delegate to new function
@@ -153,13 +161,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
           service_pids :: %{Log.id() => pid()}
         ) :: {:ok, pid()} | {:error, term()}
   def copy_log_data(new_log_id, survivor_pids, first_version, last_version, service_pids) do
-    Log.recover_from(
-      Map.fetch!(service_pids, new_log_id),
-      survivor_pids,
-      first_version,
-      last_version
-    )
+    target_pid = Map.fetch!(service_pids, new_log_id)
+    survivor_pids = normalize_survivor_pids(survivor_pids)
+    Log.recover_from(target_pid, survivor_pids, first_version, last_version)
   end
+
+  defp normalize_survivor_pids(:none), do: []
+  defp normalize_survivor_pids(nil), do: []
+  defp normalize_survivor_pids(survivor_pids) when is_list(survivor_pids), do: survivor_pids
+  defp normalize_survivor_pids(survivor_pid), do: [survivor_pid]
 
   # Legacy pairing function kept for backward compatibility with tests
   @spec pair_with_old_log_ids([Log.id()], [Log.id()]) ::

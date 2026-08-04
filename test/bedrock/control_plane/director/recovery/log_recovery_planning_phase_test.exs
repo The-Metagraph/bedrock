@@ -35,11 +35,16 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhaseTest do
       old_logs = %{{:log, 1} => %{}, {:log, 2} => %{}}
       {recovery_attempt, context} = recovery_setup(log_recovery_info, old_logs, 2)
 
-      assert {%{old_log_ids_to_copy: old_log_ids, version_vector: version_vector, durable_version: durable_version},
-              LogRecruitmentPhase} =
+      assert {%{
+                old_log_ids_to_copy: old_log_ids,
+                version_vector: version_vector,
+                durable_version: durable_version,
+                logs: logs
+              }, LogRecruitmentPhase} =
                LogRecoveryPlanningPhase.execute(recovery_attempt, context)
 
       assert is_list(old_log_ids) and length(old_log_ids) == 2
+      assert logs == old_logs
       assert is_tuple(version_vector)
       # version_vector is {max(oldest), min(newest)} = {10, 45}
       assert version_vector == {Version.from_integer(10), Version.from_integer(45)}
@@ -105,19 +110,48 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhaseTest do
       assert length(result.survivor_log_ids) == 2
       assert {:log, 1} in result.survivor_log_ids
       assert {:log, 2} in result.survivor_log_ids
+      assert result.logs == Map.take(old_logs, result.survivor_log_ids)
     end
 
-    test "shard_tags in old_logs are ignored (consistent hashing)" do
-      # Old logs may have shard_tags from previous layout, but they are ignored
+    test "rebuilds consistent-hash recovery layout from fresh log vacancies" do
+      log_recovery_info = %{{:log, 1} => log_info(10, 50), {:log, 3} => log_info(5, 45)}
+
+      old_logs = %{
+        {:log, 1} => [],
+        {:log, 2} => [],
+        {:log, 3} => []
+      }
+
+      {recovery_attempt, context} = recovery_setup(log_recovery_info, old_logs, 3)
+
+      assert {%{logs: logs}, LogRecruitmentPhase} =
+               LogRecoveryPlanningPhase.execute(recovery_attempt, context)
+
+      assert logs == %{{:vacancy, 1} => [], {:vacancy, 2} => [], {:vacancy, 3} => []}
+    end
+
+    test "uses fresh vacancies for all-empty consistent-hash layouts" do
+      log_recovery_info = %{{:log, 1} => log_info(10, 50), {:log, 2} => log_info(5, 45)}
+      old_logs = %{{:log, 1} => [], {:log, 2} => []}
+      {recovery_attempt, context} = recovery_setup(log_recovery_info, old_logs, 2)
+
+      assert {%{logs: logs, old_log_ids_to_copy: old_log_ids}, LogRecruitmentPhase} =
+               LogRecoveryPlanningPhase.execute(recovery_attempt, context)
+
+      assert length(old_log_ids) == 2
+      assert logs == %{{:vacancy, 1} => [], {:vacancy, 2} => []}
+    end
+
+    test "preserves survivor descriptors for legacy non-empty layouts" do
       log_recovery_info = %{{:log, 1} => log_info(10, 50), {:log, 2} => log_info(5, 45)}
       old_logs = %{{:log, 1} => ["tag_a", "tag_b"], {:log, 2} => ["tag_a"]}
       {recovery_attempt, context} = recovery_setup(log_recovery_info, old_logs, 2)
 
-      # Should still succeed - shard_tags are ignored
-      assert {%{old_log_ids_to_copy: old_log_ids}, LogRecruitmentPhase} =
+      assert {%{logs: logs, old_log_ids_to_copy: old_log_ids}, LogRecruitmentPhase} =
                LogRecoveryPlanningPhase.execute(recovery_attempt, context)
 
       assert length(old_log_ids) == 2
+      assert logs == old_logs
     end
   end
 
@@ -192,7 +226,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhaseTest do
 
       invalid_ranges = [
         {Version.from_integer(50), Version.from_integer(10)},
-        {Version.from_integer(10), Version.zero()}
+        {Version.from_integer(10), Version.zero()},
+        {Version.zero(), nil}
       ]
 
       Enum.each(valid_ranges, fn range ->

@@ -87,6 +87,84 @@ defmodule Bedrock.DataPlane.Log.Shale.PushingTest do
 
       assert :ok = Writer.close(writer)
     end
+
+    test "synchronizes an ordinary live push before acknowledging it" do
+      path = Path.join(System.tmp_dir!(), "shale_push_order_#{System.unique_integer([:positive])}.log")
+      File.write!(path, :binary.copy(<<0>>, 1024))
+      on_exit(fn -> File.rm(path) end)
+      caller = self()
+
+      assert {:ok, writer} =
+               Writer.open(path,
+                 sync_fun: fn _fd ->
+                   send(caller, :sync)
+                   :ok
+                 end
+               )
+
+      state = %State{
+        mode: :running,
+        last_version: Version.from_integer(0),
+        pending_pushes: %{},
+        writer: writer,
+        active_segment: %Segment{path: path, min_version: Version.zero(), transactions: []}
+      }
+
+      transaction = TransactionTestSupport.new_log_transaction(0, %{"a" => "1"})
+
+      assert {:ok, %{writer: updated_writer}} =
+               Pushing.push(state, Version.from_integer(0), transaction, fn result ->
+                 send(caller, {:ack, result})
+                 :ok
+               end)
+
+      assert_receive :sync
+      assert_receive {:ack, :ok}
+      assert :ok = Writer.close(updated_writer)
+    end
+
+    test "ordinary pushes cannot use a recovering target" do
+      state = %State{mode: :recovering, last_version: Version.from_integer(0)}
+      transaction = TransactionTestSupport.new_log_transaction(0, %{"a" => "1"})
+
+      assert {:error, :not_ready} =
+               Pushing.push(state, Version.from_integer(0), transaction, fn _result -> :ok end)
+    end
+  end
+
+  describe "push_recovery/3" do
+    test "uses deferred durability only for a recovering target" do
+      path = Path.join(System.tmp_dir!(), "shale_recovery_push_#{System.unique_integer([:positive])}.log")
+      File.write!(path, :binary.copy(<<0>>, 1024))
+      on_exit(fn -> File.rm(path) end)
+      caller = self()
+
+      assert {:ok, writer} =
+               Writer.open(path,
+                 sync_fun: fn _fd ->
+                   send(caller, :sync)
+                   :ok
+                 end
+               )
+
+      state = %State{
+        mode: :recovering,
+        last_version: Version.from_integer(0),
+        pending_pushes: %{},
+        writer: writer,
+        active_segment: %Segment{path: path, min_version: Version.zero(), transactions: []}
+      }
+
+      transaction = TransactionTestSupport.new_log_transaction(0, %{"a" => "1"})
+
+      assert {:ok, %{writer: %Writer{dirty?: true} = updated_writer}} =
+               Pushing.push_recovery(state, Version.from_integer(0), transaction)
+
+      refute_receive :sync, 20
+      assert {:ok, updated_writer} = Writer.sync(updated_writer)
+      assert_receive :sync
+      assert :ok = Writer.close(updated_writer)
+    end
   end
 
   describe "write_encoded_transaction/2 error handling" do

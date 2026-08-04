@@ -14,6 +14,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.LogicTest do
   alias Bedrock.ObjectStorage
   alias Bedrock.ObjectStorage.LocalFilesystem
   alias Bedrock.ObjectStorage.Snapshot
+  alias Bedrock.Test.DataPlane.TransactionTestSupport
 
   setup do
     test_dir = Path.join(System.tmp_dir!(), "olivine_logic_test_#{:rand.uniform(100_000)}")
@@ -142,13 +143,29 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.LogicTest do
       layout = %{logs: %{}, services: %{}}
       durable_version = 100
 
-      assert {:ok, %State{mode: :running} = unlocked_state} =
+      assert {:ok, %State{mode: :running, pull_task: pull_task} = unlocked_state} =
                Logic.unlock_after_recovery(locked_state, durable_version, layout)
 
       # A puller is installed so the materializer can catch up from the logs
-      assert unlocked_state.pull_task
+      assert %Task{} = pull_task
 
       Logic.shutdown(unlocked_state)
+    end
+  end
+
+  describe "info/2 version separation" do
+    test "current_version advances independently from durable_version", %{test_dir: test_dir} do
+      state = create_test_state(test_dir)
+      version = Version.from_integer(100)
+      transaction = TransactionTestSupport.new_log_transaction(version, %{"key" => "value"})
+
+      assert {:ok, updated_state, ^version} = Logic.apply_transactions(state, [transaction])
+
+      assert {:ok, %{current_version: ^version, durable_version: durable_version}} =
+               Logic.info(updated_state, [:current_version, :durable_version])
+
+      assert durable_version == Version.zero()
+      Logic.shutdown(updated_state)
     end
   end
 

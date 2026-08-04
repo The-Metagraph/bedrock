@@ -45,7 +45,10 @@ config :bedrock, MyCluster,
 
 Commit acknowledgments are gated by WAL durability: a log server acknowledges
 only after the WAL append is written and fsynced. Async object persistence
-remains separate and does not gate commit ACKs.
+remains separate and does not gate commit ACKs. Log-to-log recovery preserves
+that live invariant while amortizing restart I/O: recovery synchronizes once
+per dirty output segment and completes its final sync before the recovered log
+can become running.
 
 ## S3/MinIO Tests
 

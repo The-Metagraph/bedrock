@@ -165,6 +165,7 @@ defmodule Bedrock.DataPlane.Materializer.Basalt.Logic do
   end
 
   defp supported_info, do: ~w[
+      current_version
       durable_version
       oldest_durable_version
       id
@@ -180,6 +181,7 @@ defmodule Bedrock.DataPlane.Materializer.Basalt.Logic do
     ]a
 
   defp gather_info(:oldest_durable_version, t), do: Database.oldest_durable_version(t.database)
+  defp gather_info(:current_version, t), do: Database.last_committed_version(t.database)
   defp gather_info(:durable_version, t), do: Database.last_durable_version(t.database)
   defp gather_info(:id, t), do: t.id
   defp gather_info(:key_ranges, t), do: Database.info(t.database, :key_ranges)

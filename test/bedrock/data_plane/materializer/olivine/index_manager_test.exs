@@ -479,6 +479,32 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManagerTest do
 
       Database.close(db)
     end
+
+    test "apply_transactions/2 ignores duplicate and older versions" do
+      vm = IndexManager.new()
+      db = create_test_database()
+      latest_version = Version.from_integer(200)
+
+      latest_transaction =
+        test_transaction([{:set, <<"key">>, <<"latest">>}], latest_version)
+
+      stale_transactions = [
+        test_transaction([{:set, <<"key">>, <<"older">>}], Version.from_integer(100)),
+        latest_transaction
+      ]
+
+      {current_vm, current_db} =
+        IndexManager.apply_transactions(vm, [latest_transaction], db)
+
+      {unchanged_vm, unchanged_db} =
+        IndexManager.apply_transactions(current_vm, stale_transactions, current_db)
+
+      assert unchanged_vm == current_vm
+      assert unchanged_db == current_db
+      assert unchanged_vm.current_version == latest_version
+
+      Database.close(unchanged_db)
+    end
   end
 
   describe "version management and windowing" do

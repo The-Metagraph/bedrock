@@ -212,8 +212,17 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
     trace_recover_from(source_logs, first_version, last_version)
 
     case recover_from(t, source_logs, first_version, last_version) do
-      {:ok, t} -> reply(t, {:ok, self()})
-      {:error, reason} -> reply(t, {:error, {:failed_to_recover, reason}})
+      {:ok, t} ->
+        reply(t, {:ok, self()})
+
+      {:error, {:recovery_cleanup_failed, _, _} = reason, failed_t} ->
+        {:stop, reason, {:error, {:failed_to_recover, reason}}, failed_t}
+
+      {:error, reason, locked_t} ->
+        reply(locked_t, {:error, {:failed_to_recover, reason}})
+
+      {:error, reason} ->
+        reply(t, {:error, {:failed_to_recover, reason}})
     end
   end
 
@@ -353,7 +362,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
 
       {:ok, [active_segment | segments]} ->
         active_segment = Segment.ensure_transactions_are_loaded(active_segment)
-        last_version = Segment.last_version(active_segment)
+        last_version = Segment.last_version(active_segment) || active_segment.min_version
         oldest_version = Enum.min([active_segment.min_version | Enum.map(segments, & &1.min_version)])
         {:ok, {oldest_version, last_version, active_segment, segments}}
 
