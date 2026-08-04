@@ -116,6 +116,36 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhaseTest do
                )
     end
 
+    test "does not complete until each target recovery barrier returns" do
+      test_pid = self()
+      new_log_id = "new-log"
+      recovery_attempt = %{service_pids: %{new_log_id => self()}}
+
+      copy_log_data_fn = fn _new_log_id, _survivor_pids, _first_version, _last_version, _service_pids ->
+        send(test_pid, {:replay_started, self()})
+
+        receive do
+          :release_recovery_barrier -> {:ok, self()}
+        end
+      end
+
+      task =
+        Task.async(fn ->
+          LogReplayPhase.replay_into_new_logs(
+            [],
+            [new_log_id],
+            {Version.from_integer(0), Version.from_integer(0)},
+            recovery_attempt,
+            %{copy_log_data_fn: copy_log_data_fn}
+          )
+        end)
+
+      assert_receive {:replay_started, replay_worker}
+      assert Task.yield(task, 20) == nil
+      send(replay_worker, :release_recovery_barrier)
+      assert Task.await(task) == :ok
+    end
+
     # Note: Tests that call Log.recover_from are commented out since
     # they require proper log process mocking which is complex in unit tests
     # The function's core logic is tested through the pair_with_old_log_ids tests

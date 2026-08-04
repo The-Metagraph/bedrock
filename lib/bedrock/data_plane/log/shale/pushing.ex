@@ -28,7 +28,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
         :ok = ack_fn.(:ok)
         do_pending_pushes(t)
 
-      {:error, reason} ->
+      {:error, reason, _failed_t} ->
         :ok = ack_fn.({:error, reason})
         {:error, reason}
     end
@@ -45,7 +45,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
 
   @doc false
   @spec push_recovery(State.t(), Bedrock.version(), Transaction.encoded()) ::
-          {:ok, State.t()} | {:error, term()}
+          {:ok, State.t()} | {:error, term(), State.t()}
   def push_recovery(%{mode: :recovering} = t, expected_version, encoded_transaction)
       when expected_version == t.last_version and byte_size(encoded_transaction) <= 10_000_000 do
     case write_encoded_transaction(t, encoded_transaction, :deferred, nil) do
@@ -53,17 +53,18 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
         trace_push_transaction(encoded_transaction)
         {:ok, t}
 
-      {:error, _reason} = error ->
+      {:error, _reason, _failed_t} = error ->
         error
     end
   end
 
-  def push_recovery(%{mode: :recovering}, _expected_version, encoded_transaction)
-      when byte_size(encoded_transaction) > 10_000_000, do: {:error, :tx_too_large}
+  def push_recovery(%{mode: :recovering} = t, _expected_version, encoded_transaction)
+      when byte_size(encoded_transaction) > 10_000_000, do: {:error, :tx_too_large, t}
 
-  def push_recovery(%{mode: :recovering}, _expected_version, _encoded_transaction), do: {:error, :tx_out_of_order}
+  def push_recovery(%{mode: :recovering} = t, _expected_version, _encoded_transaction),
+    do: {:error, :tx_out_of_order, t}
 
-  def push_recovery(_t, _expected_version, _encoded_transaction), do: {:error, :not_recovering}
+  def push_recovery(t, _expected_version, _encoded_transaction), do: {:error, :not_recovering, t}
 
   @spec do_pending_pushes(State.t()) ::
           {:ok | :wait, State.t()} | {:error, :tx_out_of_order} | {:error, :tx_too_large}
@@ -93,7 +94,10 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
   @spec write_encoded_transaction(State.t(), Transaction.encoded()) ::
           {:ok, State.t()} | {:error, term()}
   def write_encoded_transaction(t, encoded_transaction) do
-    write_encoded_transaction(t, encoded_transaction, :immediate, nil)
+    case write_encoded_transaction(t, encoded_transaction, :immediate, nil) do
+      {:ok, t} -> {:ok, t}
+      {:error, reason, _failed_t} -> {:error, reason}
+    end
   end
 
   defp write_encoded_transaction(t, encoded_transaction, durability, sync_fun) when is_nil(t.writer) do
@@ -106,24 +110,30 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
           raise "Failed to extract version: #{inspect(reason)}"
       end
 
-    with {:ok, new_segment} <-
-           Segment.allocate_from_recycler(
-             t.segment_recycler,
-             t.path,
-             version
-           ),
-         {:ok, new_writer} <- open_writer(new_segment.path, sync_fun) do
-      write_encoded_transaction(
-        %{
+    case Segment.allocate_from_recycler(t.segment_recycler, t.path, version) do
+      {:ok, new_segment} ->
+        allocated_t = %{
           t
-          | writer: new_writer,
+          | writer: nil,
             active_segment: new_segment,
             segments: if(t.active_segment, do: [t.active_segment | t.segments], else: t.segments)
-        },
-        encoded_transaction,
-        durability,
-        sync_fun
-      )
+        }
+
+        case open_writer(new_segment.path, sync_fun) do
+          {:ok, new_writer} ->
+            write_encoded_transaction(
+              %{allocated_t | writer: new_writer},
+              encoded_transaction,
+              durability,
+              sync_fun
+            )
+
+          {:error, reason} ->
+            {:error, {:writer_open_failed, reason}, allocated_t}
+        end
+
+      {:error, reason} ->
+        {:error, reason, t}
     end
   end
 
@@ -139,27 +149,43 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
           {:error, :segment_full} ->
             next_sync_fun = t.writer.sync_fun
 
-            with {:ok, writer} <- Writer.sync(t.writer),
-                 :ok <- Writer.close(writer) do
-              write_encoded_transaction(
-                %{t | writer: nil},
-                encoded_transaction,
-                durability,
-                next_sync_fun
-              )
+            case sync_and_close_full_segment(t.writer) do
+              :ok ->
+                write_encoded_transaction(
+                  %{t | writer: nil},
+                  encoded_transaction,
+                  durability,
+                  next_sync_fun
+                )
+
+              {:error, reason} ->
+                {:error, reason, t}
             end
 
-          {:error, _reason} = error ->
-            error
+          {:error, reason} ->
+            {:error, reason, t}
         end
 
       {:error, reason} ->
-        {:error, {:version_extraction_failed, reason}}
+        {:error, {:version_extraction_failed, reason}, t}
     end
   end
 
   defp open_writer(path, nil), do: Writer.open(path)
   defp open_writer(path, sync_fun), do: Writer.open(path, sync_fun: sync_fun)
+
+  defp sync_and_close_full_segment(writer) do
+    case Writer.sync(writer) do
+      {:ok, writer} ->
+        case Writer.close(writer) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:segment_close_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:segment_sync_failed, reason}}
+    end
+  end
 
   @spec update_segment_transaction_cache(Segment.t(), Transaction.encoded()) :: Segment.t()
   defp update_segment_transaction_cache(segment, encoded_transaction) do
