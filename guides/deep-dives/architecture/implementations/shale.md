@@ -44,7 +44,10 @@ For transactions that fit within the WAL size limit, Shale appends them directly
 
 Large transactions follow a different path. Shale allocates a segment file, writes the transaction data there, and then writes a reference entry in the WAL. This keeps the WAL compact while ensuring that all transactions, regardless of size, are recorded in version order. Segment management is handled in [`lib/bedrock/data_plane/log/shale/segment.ex`](../../../lib/bedrock/data_plane/log/shale/segment.ex).
 
-After writing transaction data, Shale forces a disk sync to ensure durability before acknowledging the write. This is the critical step that guarantees committed transactions survive system failures.
+After writing live transaction data, Shale forces a disk sync before
+acknowledging the write. There is no operator setting that relaxes this rule.
+This is the critical step that guarantees acknowledged commits survive system
+failures.
 
 ## Index Management
 
@@ -67,6 +70,21 @@ Long-running pull requests use streaming to avoid loading large result sets into
 Shale recovery begins by reading the manifest to understand the last known state. Then it scans WAL files to rebuild the transaction index and verify data integrity. The recovery logic is implemented in [`lib/bedrock/data_plane/log/shale/recovery.ex`](../../../lib/bedrock/data_plane/log/shale/recovery.ex).
 
 During recovery, Shale can operate in several modes. Cold start recovery rebuilds state from disk files. Log-to-log recovery copies transactions from another Shale instance to restore a failed log server. The recovery mode is determined by what data is available and what the Director requests.
+
+Log-to-log replay preserves every source entry, including heartbeat-only
+transactions, with the same bytes, version order, and WAL framing. Because the
+target is locked and cannot acknowledge live commits during this operation,
+the writer may defer physical synchronization while filling a segment. It
+synchronizes every dirty full segment before closing it and synchronizes the
+final dirty segment before validating recovery success and changing the target
+to running. This turns synchronization cost from one operation per replayed
+entry into one operation per dirty output segment without introducing a
+durability window on the live push path.
+
+An append, pull, version-validation, or synchronization failure keeps the
+target non-authoritative. Partial target segments are closed and recycled
+before another source is attempted; cleanup failure terminates the worker so
+the Director can recruit a coherent replacement.
 
 Recovery includes integrity verification, checking that transaction checksums match and that version sequences are complete. If corruption is detected, Shale can attempt to recover valid transactions while reporting problems for manual intervention.
 
@@ -94,7 +112,10 @@ For recoverable errors like temporary disk space issues, Shale includes cleanup 
 
 Shale's configuration focuses on balancing durability, performance, and resource usage. WAL file sizes affect rotation frequency and recovery time. Segment pre-allocation affects memory usage and large transaction performance.
 
-Sync policies control the trade-off between durability and performance. Immediate sync after every write maximizes durability but limits throughput. Batched sync improves performance but increases the window of potential data loss.
+Sync behavior is selected internally by lifecycle state, not configuration.
+Live pushes always use immediate sync-before-ack. Only a locked recovery target
+uses deferred appends, with mandatory segment and completion barriers; callers
+cannot opt ordinary writes into deferred durability.
 
 Buffer sizes affect memory usage and I/O efficiency. Larger buffers can improve performance for workloads with many small transactions but use more memory.
 

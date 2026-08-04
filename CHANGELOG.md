@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Bound Shale restart synchronization to recovery segments.** Ordinary live
+  log pushes still synchronize the WAL before acknowledgement. Log-to-log
+  recovery now writes unchanged transactions with deferred durability, syncs
+  each dirty full segment before closing it, and syncs the final dirty segment
+  before the target becomes running. Failed barriers leave the target locked
+  and partial output is recycled before another source is tried.
+
 ## 0.5.0 — 2026-03-10
 
 - **Rename Storage to Materializer.** The `Bedrock.DataPlane.Storage` module tree has been renamed to `Bedrock.DataPlane.Materializer` to better reflect its role — materializing committed state from the write-ahead log. The `:storage` capability is now `:materializer` in cluster config, and the corresponding config key changes accordingly:
