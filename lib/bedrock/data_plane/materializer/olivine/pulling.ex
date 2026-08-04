@@ -12,7 +12,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Pulling do
           start_after: Bedrock.version(),
           worker_id: Worker.id(),
           apply_transactions_fn: ([Transaction.encoded()] -> Bedrock.version()),
-          get_durable_version_fn: (-> Bedrock.version()),
+          get_durable_version_fn: (-> {:ok, Bedrock.version()} | {:error, term()}),
           logs: %{Log.id() => LogDescriptor.t()},
           services: %{Worker.id() => ServiceDescriptor.t()},
           failed_logs: %{Log.id() => any()},
@@ -25,7 +25,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Pulling do
           logs :: %{Log.id() => LogDescriptor.t()},
           services :: %{Worker.id() => ServiceDescriptor.t()},
           apply_transactions_fn :: ([Transaction.encoded()] -> Bedrock.version()),
-          get_durable_version_fn :: (-> Bedrock.version())
+          get_durable_version_fn :: (-> {:ok, Bedrock.version()} | {:error, term()})
         ) :: Task.t()
   def start_pulling(start_after, worker_id, logs, services, apply_transactions_fn, get_durable_version_fn) do
     state = %{
