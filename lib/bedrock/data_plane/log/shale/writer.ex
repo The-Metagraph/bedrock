@@ -81,8 +81,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Writer do
   @spec append(t(), Transaction.encoded(), Bedrock.version(), durability()) ::
           {:ok, t()} | {:error, :segment_full} | {:error, term()}
   def append(%__MODULE__{} = writer, transaction, _commit_version, durability)
-      when durability in [:immediate, :deferred] and
-             writer.bytes_remaining < 16 + byte_size(transaction),
+      when durability in [:immediate, :deferred] and writer.bytes_remaining < 16 + byte_size(transaction),
       do: {:error, :segment_full}
 
   def append(%__MODULE__{} = writer, transaction, commit_version, durability)
@@ -118,8 +117,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Writer do
     end
   end
 
-  def append(%__MODULE__{}, _transaction, _commit_version, durability),
-    do: {:error, {:invalid_durability, durability}}
+  def append(%__MODULE__{}, _transaction, _commit_version, durability), do: {:error, {:invalid_durability, durability}}
 
   defp maybe_sync(writer, :immediate), do: sync(writer)
   defp maybe_sync(writer, :deferred), do: {:ok, writer}

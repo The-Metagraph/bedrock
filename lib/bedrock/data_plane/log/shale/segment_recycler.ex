@@ -17,7 +17,7 @@ defmodule Bedrock.DataPlane.Log.Shale.SegmentRecycler do
   Return a segment to the recycler. The recycler will attempt to delete the
   segment if it has too many on-hand.
   """
-  @spec check_in(server(), path :: String.t()) :: :ok
+  @spec check_in(server(), path :: String.t()) :: :ok | {:error, term()}
   def check_in(segment_recycler, segment), do: GenServer.call(segment_recycler, {:check_in, segment})
 
   @spec child_spec(term()) :: Supervisor.child_spec()

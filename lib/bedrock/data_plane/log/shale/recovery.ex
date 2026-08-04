@@ -20,7 +20,6 @@ defmodule Bedrock.DataPlane.Log.Shale.Recovery do
   alias Bedrock.DataPlane.Log.Shale.State
   alias Bedrock.DataPlane.Log.Shale.Writer
   alias Bedrock.DataPlane.Transaction
-  alias Bedrock.DataPlane.Version
 
   @spec recover_from(
           State.t(),
@@ -71,9 +70,6 @@ defmodule Bedrock.DataPlane.Log.Shale.Recovery do
     else
       {:error, reason, failed_t} ->
         failed_recovery(reason, failed_t)
-
-      {:error, reason} ->
-        failed_recovery(reason, recovering)
     end
   end
 
@@ -94,13 +90,9 @@ defmodule Bedrock.DataPlane.Log.Shale.Recovery do
      }}
   end
 
-  defp min_version(nil, version), do: version
-  defp min_version(version, nil), do: version
   defp min_version(left, right) when left <= right, do: left
   defp min_version(_left, right), do: right
 
-  defp max_version(nil, version), do: version
-  defp max_version(version, nil), do: version
   defp max_version(left, right) when left >= right, do: left
   defp max_version(_left, right), do: right
 
@@ -347,9 +339,8 @@ defmodule Bedrock.DataPlane.Log.Shale.Recovery do
   defp push_sentinel_result(t, version) do
     sentinel_transaction = %{mutations: []}
     encoded_sentinel = Transaction.encode(sentinel_transaction)
-    version_binary = if is_binary(version), do: version, else: Version.from_integer(version)
 
-    with {:ok, sentinel} <- Transaction.add_commit_version(encoded_sentinel, version_binary),
+    with {:ok, sentinel} <- Transaction.add_commit_version(encoded_sentinel, version),
          {:ok, t} <- push_recovery(t, version, sentinel) do
       {:ok, t}
     else

@@ -161,6 +161,7 @@ defmodule Bedrock.DataPlane.Log.Shale.WriterTest do
 
     test "preserves dirty state for retry when synchronization fails", %{path: path} do
       assert {:ok, writer} = Writer.open(path, sync_fun: fn _fd -> {:error, :eio} end)
+
       assert {:ok, %Writer{dirty?: true} = writer} =
                Writer.append(writer, <<1>>, <<1::unsigned-big-64>>, :deferred)
 

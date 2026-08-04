@@ -140,34 +140,36 @@ defmodule Bedrock.DataPlane.Log.Shale.Pushing do
   defp write_encoded_transaction(t, encoded_transaction, durability, _sync_fun) do
     case Transaction.commit_version(encoded_transaction) do
       {:ok, version} ->
-        case Writer.append(t.writer, encoded_transaction, version, durability) do
-          {:ok, writer} ->
-            # Update the active segment's transaction cache to keep it coherent with disk
-            updated_active_segment = update_segment_transaction_cache(t.active_segment, encoded_transaction)
-            {:ok, %{t | writer: writer, last_version: version, active_segment: updated_active_segment}}
-
-          {:error, :segment_full} ->
-            next_sync_fun = t.writer.sync_fun
-
-            case sync_and_close_full_segment(t.writer) do
-              :ok ->
-                write_encoded_transaction(
-                  %{t | writer: nil},
-                  encoded_transaction,
-                  durability,
-                  next_sync_fun
-                )
-
-              {:error, reason} ->
-                {:error, reason, t}
-            end
-
-          {:error, reason} ->
-            {:error, reason, t}
-        end
+        append_encoded_transaction(t, encoded_transaction, version, durability)
 
       {:error, reason} ->
         {:error, {:version_extraction_failed, reason}, t}
+    end
+  end
+
+  defp append_encoded_transaction(t, encoded_transaction, version, durability) do
+    case Writer.append(t.writer, encoded_transaction, version, durability) do
+      {:ok, writer} ->
+        updated_active_segment = update_segment_transaction_cache(t.active_segment, encoded_transaction)
+        {:ok, %{t | writer: writer, last_version: version, active_segment: updated_active_segment}}
+
+      {:error, :segment_full} ->
+        rotate_and_retry(t, encoded_transaction, durability)
+
+      {:error, reason} ->
+        {:error, reason, t}
+    end
+  end
+
+  defp rotate_and_retry(t, encoded_transaction, durability) do
+    next_sync_fun = t.writer.sync_fun
+
+    case sync_and_close_full_segment(t.writer) do
+      :ok ->
+        write_encoded_transaction(%{t | writer: nil}, encoded_transaction, durability, next_sync_fun)
+
+      {:error, reason} ->
+        {:error, reason, t}
     end
   end
 
