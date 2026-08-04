@@ -153,7 +153,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.LogicTest do
     end
   end
 
-  describe "info/2" do
+  describe "info/2 version separation" do
     test "current_version advances independently from durable_version", %{test_dir: test_dir} do
       state = create_test_state(test_dir)
       version = Version.from_integer(100)

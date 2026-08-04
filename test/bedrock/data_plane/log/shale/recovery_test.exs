@@ -1,5 +1,5 @@
 defmodule Bedrock.DataPlane.Log.Shale.RecoveryTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Bedrock.DataPlane.Log.Shale.Recovery
   alias Bedrock.DataPlane.Log.Shale.Segment
