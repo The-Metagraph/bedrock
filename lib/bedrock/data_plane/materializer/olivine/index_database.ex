@@ -115,8 +115,32 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexDatabase do
   @spec load_page_block(t(), Bedrock.version()) ::
           {:ok, %{Page.id() => {Page.t(), Page.id()}}, Bedrock.version() | nil} | {:error, :not_found}
   def load_page_block(index_db, target_version) do
-    scan_backward_for_version(index_db.file, index_db.file_offset, target_version)
+    case load_page_block_before(index_db, target_version, index_db.file_offset) do
+      {:ok, pages_map, next_version, _next_scan_offset} ->
+        {:ok, pages_map, next_version}
+
+      {:error, :not_found} = error ->
+        error
+    end
   end
+
+  @doc """
+  Loads a page block while continuing a caller-owned backward scan.
+
+  The returned offset is immediately before the matched record. Passing it to
+  the next call prevents incremental recovery from rescanning newer version
+  blocks from end-of-file for every link in the version chain.
+  """
+  @spec load_page_block_before(t(), Bedrock.version(), non_neg_integer()) ::
+          {:ok, %{Page.id() => {Page.t(), Page.id()}}, Bedrock.version() | nil, non_neg_integer()}
+          | {:error, :not_found}
+  def load_page_block_before(index_db, target_version, scan_offset)
+      when is_integer(scan_offset) and scan_offset >= 0 and scan_offset <= index_db.file_offset do
+    scan_backward_for_version(index_db.file, scan_offset, target_version)
+  end
+
+  @spec end_offset(t()) :: non_neg_integer()
+  def end_offset(index_db), do: index_db.file_offset
 
   @spec flush(
           t(),
@@ -274,7 +298,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexDatabase do
       if version == target_version do
         {previous_version, pages_map} = :erlang.binary_to_term(payload)
         next_version = if previous_version == version, do: nil, else: previous_version
-        {:ok, pages_map, next_version}
+        {:ok, pages_map, next_version, record_offset}
       else
         scan_backward_for_version(file, record_offset, target_version)
       end

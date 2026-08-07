@@ -191,6 +191,50 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IncrementalLoadingTest do
       Database.close(recovered_database)
     end
 
+    test "version-chain reads carry a strictly decreasing scan cursor", %{tmp_dir: tmp_dir} do
+      file_path = Path.join(tmp_dir, "scan_cursor_test.dets")
+      {:ok, database} = Database.open(:scan_cursor_test, file_path)
+
+      {final_database, versions} =
+        Enum.reduce(1..3, {database, []}, fn version_int, {database, versions} ->
+          version = Version.from_integer(version_int)
+          previous_version = Database.durable_version(database)
+          page = Page.new(0, [{"key-#{version_int}", <<version_int::64>>}])
+
+          {:ok, database, _metadata} =
+            Database.advance_durable_version(
+              database,
+              version,
+              previous_version,
+              data_size_in_bytes(database),
+              [%{0 => {page, 0}}]
+            )
+
+          {database, [version | versions]}
+        end)
+
+      {_data_db, index_db} = final_database
+      [version_3, version_2, version_1] = versions
+      end_offset = IndexDatabase.end_offset(index_db)
+
+      assert {:ok, _pages, ^version_2, before_version_3} =
+               IndexDatabase.load_page_block_before(index_db, version_3, end_offset)
+
+      assert {:ok, _pages, ^version_1, before_version_2} =
+               IndexDatabase.load_page_block_before(index_db, version_2, before_version_3)
+
+      assert {:ok, _pages, next_version, before_version_1} =
+               IndexDatabase.load_page_block_before(index_db, version_1, before_version_2)
+
+      assert next_version == Version.zero()
+      assert end_offset > before_version_3
+      assert before_version_3 > before_version_2
+      assert before_version_2 > before_version_1
+      assert before_version_1 == 0
+
+      Database.close(final_database)
+    end
+
     test "pages within same version block resolve locally and exclude old unreachable pages", %{tmp_dir: tmp_dir} do
       # This test ensures that incremental loading only loads pages that are part of the current chain,
       # and excludes old pages that are no longer reachable from the current index structure
