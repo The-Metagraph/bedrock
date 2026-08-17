@@ -42,6 +42,25 @@ defmodule Bedrock.Internal.Repo do
     end
   end
 
+  @spec get_many(module(), [key()]) :: %{key() => value() | nil}
+  def get_many(repo_module, keys), do: get_many(repo_module, keys, [])
+
+  @spec get_many(module(), [key()], opts :: keyword()) :: %{key() => value() | nil}
+  def get_many(repo_module, keys, opts) do
+    t = txn!(repo_module)
+
+    case GenServer.call(t, {:get_many, keys, opts}, :infinity) do
+      {:ok, values} when is_map(values) ->
+        values
+
+      {:failure, reason} when reason in [:timeout, :unavailable, :version_too_new] ->
+        throw({__MODULE__, t, :retryable_failure, reason})
+
+      {failure_or_error, reason} when failure_or_error in [:error, :failure] and is_atom(reason) ->
+        throw({__MODULE__, t, :transaction_error, reason, :get_many, length(keys)})
+    end
+  end
+
   @spec select(module(), KeySelector.t()) :: nil | {resolved_key :: key(), value()}
   def select(repo_module, %KeySelector{} = key_selector), do: select(repo_module, key_selector, [])
 

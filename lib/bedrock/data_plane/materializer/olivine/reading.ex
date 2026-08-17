@@ -115,6 +115,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
     do: execute_request(manager, context, :get, {key_or_selector, version}, opts)
 
   @doc """
+  Handle a bounded exact-key batch with one lifecycle-managed read task.
+  """
+  @spec handle_get_many(t(), ReadingContext.t(), [Bedrock.key()], Bedrock.version(), keyword()) ::
+          {t(), term()}
+  def handle_get_many(manager, context, keys, version, opts),
+    do: execute_request(manager, context, :get_many, {keys, version}, opts)
+
+  @doc """
   Handle a get_range request with full lifecycle management (async, waitlist, task tracking).
   Returns {updated_manager, result}.
   """
@@ -218,6 +226,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
 
   defp extract_operation_key(:get, {%KeySelector{} = key_selector, _version}), do: key_selector
   defp extract_operation_key(:get, {key, _version}) when is_binary(key), do: key
+  defp extract_operation_key(:get_many, {keys, _version}), do: {:key_count, length(keys)}
 
   defp extract_operation_key(:get_range, {start_key, end_key, _version}), do: {start_key, end_key}
 
@@ -234,6 +243,18 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
 
       error ->
         error
+    end
+  end
+
+  defp setup_fetch_task(
+         %ReadingContext{index_manager: index_manager, database: database},
+         :get_many,
+         {keys, version},
+         _opts
+       ) do
+    with {:ok, key_pages} <- resolve_keys_to_pages(index_manager, keys, version) do
+      load_many_fn = Database.many_value_loader(database)
+      {:ok, fn -> fetch_many_from_pages(key_pages, load_many_fn) end}
     end
   end
 
@@ -272,6 +293,20 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
   defp resolve_key_to_page(index_manager, key, version) when is_binary(key) do
     case IndexManager.page_for_key(index_manager, key, version) do
       {:ok, page} -> {:ok, {key, page, :binary}}
+      error -> error
+    end
+  end
+
+  defp resolve_keys_to_pages(index_manager, keys, version) do
+    keys
+    |> Enum.reduce_while({:ok, []}, fn key, {:ok, key_pages} ->
+      case IndexManager.page_for_key(index_manager, key, version) do
+        {:ok, page} -> {:cont, {:ok, [{key, page} | key_pages]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, key_pages} -> {:ok, Enum.reverse(key_pages)}
       error -> error
     end
   end
@@ -342,6 +377,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
 
   defp build_waitlist_request(:get, {%KeySelector{} = ks, version}), do: {ks, version}
   defp build_waitlist_request(:get, {key, version}), do: {key, version}
+  defp build_waitlist_request(:get_many, {keys, version}), do: {keys, version}
 
   defp build_waitlist_request(:get_range, {start_key, end_key, version}), do: {start_key, end_key, version}
 
@@ -372,6 +408,17 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
 
   defp execute_fetch_request(context, reply_fn, {key, version}) when is_binary(key) do
     case execute_get(context, key, version, reply_fn: reply_fn) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      error ->
+        reply_fn.(error)
+        :ok
+    end
+  end
+
+  defp execute_fetch_request(context, reply_fn, {keys, version}) when is_list(keys) do
+    case execute_get_many(context, keys, version, reply_fn: reply_fn) do
       {:ok, pid} ->
         {:ok, pid}
 
@@ -453,6 +500,13 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
     end
   end
 
+  defp execute_get_many(%ReadingContext{index_manager: index_manager, database: database}, keys, version, opts) do
+    with {:ok, key_pages} <- resolve_keys_to_pages(index_manager, keys, version) do
+      load_many_fn = Database.many_value_loader(database)
+      do_now_or_async_with_reply(opts[:reply_fn], fn -> fetch_many_from_pages(key_pages, load_many_fn) end)
+    end
+  end
+
   defp execute_get_range(
          %ReadingContext{index_manager: index_manager, database: database},
          start_key,
@@ -510,6 +564,25 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Reading do
       {:ok, locator} -> load_fn.(locator)
       error -> error
     end
+  end
+
+  defp fetch_many_from_pages(key_pages, load_many_fn) do
+    {found, absent} =
+      Enum.reduce(key_pages, {[], []}, fn {key, page}, {found, absent} ->
+        case Page.locator_for_key(page, key) do
+          {:ok, locator} -> {[{key, locator} | found], absent}
+          {:error, :not_found} -> {found, [key | absent]}
+        end
+      end)
+
+    {:ok, values_by_locator} = found |> Enum.map(&elem(&1, 1)) |> Enum.uniq() |> load_many_fn.()
+
+    values =
+      Enum.reduce(found, Map.new(absent, &{&1, nil}), fn {key, locator}, values ->
+        Map.put(values, key, Map.fetch!(values_by_locator, locator))
+      end)
+
+    {:ok, values}
   end
 
   defp range_fetch_from_pages(pages, start_key, end_key, limit, load_many_fn) do

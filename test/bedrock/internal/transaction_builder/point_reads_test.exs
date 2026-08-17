@@ -83,6 +83,41 @@ defmodule Bedrock.Internal.TransactionBuilder.PointReadsTest do
     assert tx.reads == %{}
   end
 
+  test "exact-key batch returns hits and misses with one point conflict per key" do
+    state = build_state()
+    parent = self()
+
+    storage_get_many_fn = fn _pid, keys, _version, _opts ->
+      send(parent, {:batch_read, keys})
+      {:ok, %{"missing" => nil, "present" => "value"}}
+    end
+
+    assert {%State{tx: tx}, {:ok, %{"missing" => nil, "present" => "value"}}} =
+             PointReads.get_many(state, ["present", "missing"], storage_get_many_fn: storage_get_many_fn)
+
+    assert_receive {:batch_read, ["present", "missing"]}
+    assert {"present", Key.key_after("present")} in tx.range_reads
+    assert {"missing", Key.key_after("missing")} in tx.range_reads
+    assert tx.reads == %{"missing" => :clear, "present" => "value"}
+  end
+
+  test "exact-key batch reuses local values and snapshot reads add no conflicts" do
+    state = %{build_state() | tx: Tx.set(Tx.new(), "local", "written")}
+
+    storage_get_many_fn = fn _pid, ["remote"], _version, _opts ->
+      {:ok, %{"remote" => "read"}}
+    end
+
+    assert {%State{tx: tx}, {:ok, %{"local" => "written", "remote" => "read"}}} =
+             PointReads.get_many(state, ["local", "remote"],
+               snapshot: true,
+               storage_get_many_fn: storage_get_many_fn
+             )
+
+    assert tx.range_reads == []
+    assert tx.reads == %{}
+  end
+
   describe "key-selector read conflicts" do
     test "forward selector hit records the span from anchor to resolved key" do
       selector = KeySelector.first_greater_or_equal("m")

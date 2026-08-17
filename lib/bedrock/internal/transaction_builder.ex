@@ -60,7 +60,7 @@ defmodule Bedrock.Internal.TransactionBuilder do
   use GenServer
 
   import __MODULE__.Finalization, only: [commit: 1, rollback: 1]
-  import __MODULE__.PointReads, only: [get_key: 3, get_key_selector: 3]
+  import __MODULE__.PointReads, only: [get_key: 3, get_key_selector: 3, get_many: 3]
   import __MODULE__.RangeReads, only: [get_range: 4, get_range_selectors: 5]
   import Bedrock.Internal.GenServer.Replies
 
@@ -139,6 +139,18 @@ defmodule Bedrock.Internal.TransactionBuilder do
 
       {t, {:ok, {^key, value}}} ->
         reply(t, {:ok, value})
+    end)
+  end
+
+  def handle_call({:get_many, keys, opts}, _from, t) when is_list(keys) and is_list(opts) do
+    t
+    |> get_many(keys, opts)
+    |> then(fn
+      {t, {:failure, failures_by_reason}} ->
+        reply(t, {:failure, choose_a_reason(failures_by_reason)})
+
+      {t, result} ->
+        reply(t, result)
     end)
   end
 
