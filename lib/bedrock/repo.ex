@@ -150,6 +150,18 @@ defmodule Bedrock.Repo do
   @callback get(key :: binary()) :: nil | binary()
   @callback get(key :: binary(), opts :: [snapshot: boolean()]) :: nil | binary()
 
+  @doc """
+  Gets an exact bounded set of keys in one transaction-builder request.
+
+  The returned map contains every requested key; absent keys map to `nil`.
+  Regular reads add one point conflict per key, while `snapshot: true` skips
+  conflict tracking.
+  """
+  @callback get_many(keys :: [binary()]) :: %{binary() => binary() | nil}
+  @callback get_many(keys :: [binary()], opts :: [snapshot: boolean()]) :: %{
+              binary() => binary() | nil
+            }
+
   @callback get(Keyspace.t(), key :: binary()) :: nil | binary()
   @callback get(Keyspace.t(), key :: binary(), opts :: [snapshot: boolean()]) :: nil | binary()
 
@@ -694,6 +706,18 @@ defmodule Bedrock.Repo do
 
       @impl true
       def get(key, opts) when is_binary(key), do: raw_get(key, opts)
+
+      @impl true
+      def get_many(keys, opts \\ []) when is_list(keys) do
+        if length(keys) > 10_000 or
+             Enum.any?(keys, &(not is_binary(&1) or byte_size(&1) > 16_384)) or
+             Enum.reduce(keys, 0, &(byte_size(&1) + &2)) > 16_777_216 do
+          raise ArgumentError,
+                "keys must be binaries no larger than 16KiB, contain at most 10,000 entries, and total at most 16MiB"
+        end
+
+        Repo.get_many(__MODULE__, keys, opts)
+      end
 
       @impl true
       def get(%Keyspace{} = keyspace, key), do: keyspace_get(keyspace, key, [])

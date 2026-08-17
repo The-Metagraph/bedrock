@@ -162,6 +162,26 @@ defmodule Bedrock.Internal.RepoTransactTest do
     end
   end
 
+  describe "get_many/3" do
+    test "delegates one exact-key request and returns the complete map" do
+      test_pid = self()
+
+      txn =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", from, message} ->
+              send(test_pid, {:many_call, message})
+              GenServer.reply(from, {:ok, %{"a" => "1", "b" => nil}})
+          end
+        end)
+
+      seed_txn(txn)
+
+      assert %{"a" => "1", "b" => nil} = Repo.get_many(TestRepo, ["a", "b"])
+      assert_receive {:many_call, {:get_many, ["a", "b"], []}}
+    end
+  end
+
   describe "get_range/4 failure handling" do
     test "throws a retryable failure tuple when the batch call fails retryably" do
       txn =

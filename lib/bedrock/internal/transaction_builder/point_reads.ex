@@ -10,6 +10,7 @@ defmodule Bedrock.Internal.TransactionBuilder.PointReads do
   import Bedrock.Internal.TransactionBuilder.ReadVersions, only: [ensure_read_version: 2]
 
   alias Bedrock.DataPlane.Materializer
+  alias Bedrock.Internal.TransactionBuilder.LayoutIndex
   alias Bedrock.Internal.TransactionBuilder.State
   alias Bedrock.Internal.TransactionBuilder.StorageRacing
   alias Bedrock.Internal.TransactionBuilder.Tx
@@ -54,6 +55,117 @@ defmodule Bedrock.Internal.TransactionBuilder.PointReads do
 
       value ->
         {t, {:ok, {key, value}}}
+    end
+  end
+
+  @doc """
+  Resolve a bounded exact-key set while preserving read-your-writes,
+  repeatable-read, point-conflict, and storage-racing semantics.
+  """
+  @spec get_many(State.t(), [Bedrock.key()], keyword()) ::
+          {State.t(), {:ok, %{Bedrock.key() => Bedrock.value() | nil}} | {:failure, map()}}
+  def get_many(t, keys, opts \\ []) when is_list(keys) do
+    {known, unresolved} = partition_repeatable_reads(t.tx, keys)
+
+    case unresolved do
+      [] ->
+        {t, {:ok, known}}
+
+      unresolved ->
+        get_many_from_storage(t, unresolved, known, opts)
+    end
+  end
+
+  defp partition_repeatable_reads(tx, keys) do
+    keys
+    |> Enum.reduce({%{}, []}, fn key, {known, unresolved} ->
+      case Tx.repeatable_read(tx, key) do
+        nil -> {known, [key | unresolved]}
+        :clear -> {Map.put(known, key, nil), unresolved}
+        value -> {Map.put(known, key, value), unresolved}
+      end
+    end)
+    |> then(fn {known, unresolved} -> {known, Enum.reverse(unresolved)} end)
+  end
+
+  defp get_many_from_storage(t, keys, known, opts) do
+    with {:ok, t} <- ensure_read_version(t, opts),
+         {:ok, groups} <- group_keys_by_layout(t, keys) do
+      t = record_many_read_intents(t, keys, opts)
+
+      Enum.reduce_while(groups, {t, {:ok, known}}, fn {_range, group_keys}, {state, {:ok, values}} ->
+        case fetch_key_group(state, group_keys, opts) do
+          {state, {:ok, fetched}} ->
+            {:cont, {merge_many_storage_reads(state, fetched, opts), {:ok, Map.merge(values, fetched)}}}
+
+          {state, {:failure, failures}} ->
+            {:halt, {state, {:failure, failures}}}
+        end
+      end)
+    else
+      {:failure, failures} -> {t, {:failure, failures}}
+      {:error, :layout_lookup_failed} -> {t, {:failure, %{layout_lookup_failed: []}}}
+    end
+  end
+
+  defp group_keys_by_layout(t, keys) do
+    {:ok,
+     keys
+     |> Enum.group_by(fn key ->
+       {range, _servers} = LayoutIndex.lookup_key!(t.layout_index, key)
+       range
+     end)
+     |> Enum.sort_by(&elem(&1, 0))}
+  rescue
+    RuntimeError -> {:error, :layout_lookup_failed}
+  end
+
+  defp record_many_read_intents(t, keys, opts) do
+    if Keyword.get(opts, :snapshot, false) do
+      t
+    else
+      tx = Enum.reduce(keys, t.tx, &Tx.add_read_conflict_key(&2, &1))
+      %{t | tx: tx}
+    end
+  end
+
+  defp fetch_key_group(t, keys, opts) do
+    storage_get_many_fn = Keyword.get(opts, :storage_get_many_fn, &Materializer.get_many/4)
+
+    operation = fn storage, version, timeout ->
+      case storage_get_many_fn.(storage, keys, version, timeout: timeout) do
+        {:error, :unsupported} -> fallback_get_many(storage, keys, version, timeout)
+        result -> result
+      end
+    end
+
+    case StorageRacing.race_storage_servers(t, hd(keys), operation) do
+      {t, {:ok, {values, _range}}} when is_map(values) -> {t, {:ok, values}}
+      {t, {:failure, failures}} -> {t, {:failure, failures}}
+    end
+  end
+
+  defp fallback_get_many(storage, keys, version, timeout) do
+    Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, values} ->
+      case Materializer.get(storage, key, version, timeout: timeout) do
+        {:ok, value} -> {:cont, {:ok, Map.put(values, key, value)}}
+        {:error, :not_found} -> {:cont, {:ok, Map.put(values, key, nil)}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp merge_many_storage_reads(t, values, opts) do
+    if Keyword.get(opts, :snapshot, false) do
+      t
+    else
+      tx =
+        Enum.reduce(values, t.tx, fn
+          {key, nil}, tx -> Tx.merge_storage_read(tx, key, :not_found)
+          {key, value}, tx -> Tx.merge_storage_read(tx, key, value)
+        end)
+
+      %{t | tx: tx}
     end
   end
 

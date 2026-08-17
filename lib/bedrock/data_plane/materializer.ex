@@ -128,6 +128,49 @@ defmodule Bedrock.DataPlane.Materializer do
   end
 
   @doc """
+  Returns exact point-read results for a bounded key set in one materializer
+  request. The result map contains every key, with `nil` for absence.
+  """
+  @spec get_many(ref(), [Bedrock.key()], Bedrock.version(), keyword()) ::
+          {:ok, %{Bedrock.key() => Bedrock.value() | nil}}
+          | {:error, :version_too_old | :version_too_new | :unsupported}
+          | {:failure, :timeout | :unavailable, ref()}
+  def get_many(storage, keys, version, opts \\ []) when is_list(keys) do
+    timeout = opts[:timeout] || :infinity
+    start_time = System.monotonic_time()
+
+    try do
+      result = GenServer.call(storage, {:get_many, keys, version, opts}, timeout)
+
+      Telemetry.emit_materializer_operation(
+        :get_many_success,
+        %{duration: System.monotonic_time() - start_time, key_count: length(keys)},
+        %{materializer_id: storage, version: version, result: elem(result, 0)}
+      )
+
+      result
+    catch
+      :exit, {:timeout, _} ->
+        Telemetry.emit_materializer_operation(
+          :get_many_timeout,
+          %{duration: System.monotonic_time() - start_time, timeout_ms: timeout, key_count: length(keys)},
+          %{materializer_id: storage, version: version}
+        )
+
+        {:failure, :timeout, storage}
+
+      :exit, reason ->
+        Telemetry.emit_materializer_operation(
+          :get_many_unavailable,
+          %{duration: System.monotonic_time() - start_time, key_count: length(keys)},
+          %{materializer_id: storage, version: version, exit_reason: reason}
+        )
+
+        {:failure, :unavailable, storage}
+    end
+  end
+
+  @doc """
   Returns key-value pairs for keys in the given range at the specified version.
 
   Range is [start_key, end_key) - includes start_key, excludes end_key.

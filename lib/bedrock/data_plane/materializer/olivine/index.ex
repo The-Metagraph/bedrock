@@ -142,7 +142,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
     else
       needed_page_ids = MapSet.new([0])
 
-      case load_needed_pages(index_db, %{}, %{}, needed_page_ids, durable_version) do
+      case load_needed_pages(
+             index_db,
+             %{},
+             %{},
+             needed_page_ids,
+             durable_version,
+             IndexDatabase.end_offset(index_db)
+           ) do
         {:ok, final_page_map} ->
           build_index_from_page_map(final_page_map, max_keys, target_keys)
 
@@ -160,9 +167,10 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
           page_map :: %{Page.id() => {Page.t(), Page.id()}},
           all_pages_seen :: %{Page.id() => {Page.t(), Page.id()}},
           needed_page_ids :: MapSet.t(Page.id()),
-          Bedrock.version()
+          Bedrock.version(),
+          non_neg_integer()
         ) :: {:ok, %{Page.id() => {Page.t(), Page.id()}}} | {:error, :missing_pages}
-  defp load_needed_pages(index_db, page_map, all_pages_seen, needed_page_ids, current_version) do
+  defp load_needed_pages(index_db, page_map, all_pages_seen, needed_page_ids, current_version, scan_offset) do
     cond do
       MapSet.size(needed_page_ids) == 0 ->
         {:ok, page_map}
@@ -183,22 +191,43 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
         end
 
       true ->
-        load_needed_pages_from_version(index_db, page_map, all_pages_seen, needed_page_ids, current_version)
+        load_needed_pages_from_version(
+          index_db,
+          page_map,
+          all_pages_seen,
+          needed_page_ids,
+          current_version,
+          scan_offset
+        )
     end
   end
 
-  defp load_needed_pages_from_version(index_db, page_map, all_pages_seen, needed_page_ids, current_version) do
-    case IndexDatabase.load_page_block(index_db, current_version) do
-      {:ok, version_pages, next_version} ->
+  defp load_needed_pages_from_version(index_db, page_map, all_pages_seen, needed_page_ids, current_version, scan_offset) do
+    case IndexDatabase.load_page_block_before(index_db, current_version, scan_offset) do
+      {:ok, version_pages, next_version, next_scan_offset} ->
         updated_all_pages = Map.merge(version_pages, all_pages_seen)
 
         {updated_page_map, updated_needed} =
           process_version_pages(version_pages, page_map, needed_page_ids, updated_all_pages)
 
-        load_needed_pages(index_db, updated_page_map, updated_all_pages, updated_needed, next_version)
+        load_needed_pages(
+          index_db,
+          updated_page_map,
+          updated_all_pages,
+          updated_needed,
+          next_version,
+          next_scan_offset
+        )
 
       {:error, :not_found} ->
-        load_needed_pages(index_db, page_map, all_pages_seen, needed_page_ids, Version.zero())
+        load_needed_pages(
+          index_db,
+          page_map,
+          all_pages_seen,
+          needed_page_ids,
+          Version.zero(),
+          0
+        )
     end
   end
 
