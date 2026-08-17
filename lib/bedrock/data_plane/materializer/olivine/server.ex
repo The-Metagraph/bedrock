@@ -84,6 +84,29 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     end
   end
 
+  def handle_call({:get_many, keys, version, opts}, from, %State{} = t) do
+    Telemetry.trace_metadata(%{operation: :get_many, key_count: length(keys)})
+
+    fetch_opts = Keyword.put(opts, :reply_fn, reply_fn_for(from))
+    context = Reading.ReadingContext.new(t.index_manager, t.database)
+
+    {updated_manager, result} =
+      Reading.handle_get_many(
+        t.read_request_manager,
+        context,
+        keys,
+        version,
+        Keyword.put_new(fetch_opts, :wait_ms, 1_000)
+      )
+
+    updated_state = %{t | read_request_manager: updated_manager}
+
+    case result do
+      :ok -> noreply(updated_state, continue: :maybe_process_transactions)
+      {:error, _reason} = error -> reply(updated_state, error)
+    end
+  end
+
   def handle_call({:get_range, start_key, end_key, version, opts}, from, %State{} = t) do
     # Set operation context metadata for this request
     Telemetry.trace_metadata(%{operation: :get_range, key: {start_key, end_key}})

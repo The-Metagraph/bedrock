@@ -90,6 +90,18 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.ReadingTest do
     end
   end
 
+  describe "synchronous handle_get_many/5 (no reply_fn)" do
+    test "returns an exact map containing both hits and misses", %{
+      manager: manager,
+      context: context
+    } do
+      assert {^manager, {:ok, values}} =
+               Reading.handle_get_many(manager, context, ["key3", "missing", "key1"], v1(), [])
+
+      assert values == %{"key1" => "value1", "key3" => "value3", "missing" => nil}
+    end
+  end
+
   describe "synchronous handle_get_range/6 (no reply_fn)" do
     test "returns key-value pairs within the range", %{manager: manager, context: context} do
       assert {^manager, {:ok, {results, false}}} =
