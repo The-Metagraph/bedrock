@@ -156,6 +156,7 @@ defmodule Bedrock.Internal.TransactionBuilder.LayoutIndex do
       ranges
       |> Enum.flat_map(fn {start_key, end_key, _pids} -> [start_key, end_key] end)
       |> Enum.sort()
+      |> Enum.uniq()
 
     boundaries
     |> Enum.chunk_every(2, 1, :discard)
