@@ -105,6 +105,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
 
       {:ok, {_id, _, {:error, _}}}, acc ->
         {:cont, acc}
+
+      {:exit, {_input, _reason}}, acc ->
+        {:cont, acc}
     end)
     |> case do
       {:error, _reason} = error ->

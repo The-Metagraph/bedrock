@@ -188,6 +188,25 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhaseTest do
   end
 
   describe "Task message leak prevention" do
+    test "a timed-out retired service is ignored without crashing recovery" do
+      stale_services = %{
+        "retired-materializer" => {:materializer, {:bedrock_retired_materializer, :retired@localhost}}
+      }
+
+      context = %{
+        lock_service_fn: fn _service, _epoch -> Process.sleep(:infinity) end
+      }
+
+      assert {:ok, locked_ids, log_info, materializer_info, transaction_services, service_pids} =
+               LockingPhase.lock_old_system_services(stale_services, 2, context)
+
+      assert locked_ids == MapSet.new()
+      assert log_info == %{}
+      assert materializer_info == %{}
+      assert transaction_services == %{}
+      assert service_pids == %{}
+    end
+
     test "LockingPhase with slow tasks and race conditions does not leak Task replies" do
       # This test demonstrates that the LockingPhase correctly uses Task.async_stream
       # in a way that does NOT leak Task reply messages to the parent process,
