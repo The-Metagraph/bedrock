@@ -659,6 +659,31 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.GenServerIntegrationTest do
           :ok
       end
     end
+
+    @tag :tmp_dir
+    test "reads do not retain request keys in worker trace metadata", %{tmp_dir: tmp_dir} do
+      {_worker_id, _otp_name, pid} = setup_supervised_worker(tmp_dir, "trace_metadata")
+      v0 = Version.zero()
+
+      trace_metadata = fn ->
+        pid
+        |> Process.info(:dictionary)
+        |> elem(1)
+        |> Keyword.fetch!(:trace_metadata)
+      end
+
+      persistent_metadata = trace_metadata.()
+      assert persistent_metadata |> Map.keys() |> Enum.sort() == [:otp_name, :storage_id]
+
+      point_key = :crypto.strong_rand_bytes(8_192)
+      _point_result = GenServer.call(pid, {:get, point_key, v0, []}, @timeout)
+      assert trace_metadata.() == persistent_metadata
+
+      range_start = :crypto.strong_rand_bytes(8_192)
+      range_end = range_start <> <<0>>
+      _range_result = GenServer.call(pid, {:get_range, range_start, range_end, v0, []}, @timeout)
+      assert trace_metadata.() == persistent_metadata
+    end
   end
 
   describe "Error Handling and Edge Cases" do

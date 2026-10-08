@@ -65,9 +65,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   @impl true
 
   def handle_call({:get, key, version, opts}, from, %State{} = t) do
-    # Set operation context metadata for this request
-    Telemetry.trace_metadata(%{operation: :get, key: key})
-
+    # Reading carries operation/key in its completion event. Keeping request
+    # keys in this long-lived worker's trace metadata retains refc binaries.
     fetch_opts = opts |> Keyword.put(:reply_fn, reply_fn_for(from)) |> Keyword.put_new(:wait_ms, 1_000)
     context = Reading.ReadingContext.new(t.index_manager, t.database)
 
@@ -90,9 +89,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   end
 
   def handle_call({:get_range, start_key, end_key, version, opts}, from, %State{} = t) do
-    # Set operation context metadata for this request
-    Telemetry.trace_metadata(%{operation: :get_range, key: {start_key, end_key}})
-
+    # Reading carries the range in its completion event; worker metadata stays
+    # limited to the stable materializer identity.
     fetch_opts = opts |> Keyword.put(:reply_fn, reply_fn_for(from)) |> Keyword.put_new(:wait_ms, 1_000)
     context = Reading.ReadingContext.new(t.index_manager, t.database)
 
