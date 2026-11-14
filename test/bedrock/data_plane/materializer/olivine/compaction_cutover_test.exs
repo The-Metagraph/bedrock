@@ -351,6 +351,33 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     Logic.shutdown(state)
   end
 
+  # bedrock-mk2: a recovery can lock the worker while its compaction runs.
+  # The cutover still installs the compacted files, but it must not start a
+  # puller — the locked worker's stream position belongs to the director,
+  # and unlock_after_recovery starts the next puller.
+  test "a cutover on a locked worker resumes no puller", %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    v1000 = Version.from_integer(1_000)
+    :ok = ReplayShardServer.append(shard_server, v1000, slice(v1000, "a"))
+    await_value(pid, v1000, "a")
+
+    {:ok, task} = Logic.start_compaction(:sys.get_state(pid))
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    {:ok, _pid, _info} = GenServer.call(pid, {:lock_for_recovery, 2})
+    assert %{mode: :locked, pull_task: nil} = :sys.get_state(pid)
+
+    send(pid, cutover_msg)
+
+    assert %{mode: :locked, pull_task: nil} = :sys.get_state(pid)
+  end
+
   defp sets(prefix, range),
     do: Enum.map(range, &{:set, prefix <> String.pad_leading(Integer.to_string(&1), 4, "0"), "v"})
 

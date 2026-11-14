@@ -330,6 +330,13 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     state_after_window
   end
 
+  # A worker a recovery locked while the compaction ran must stay quiet
+  # (bedrock-mk2): stop_pulling above already released its puller, and
+  # unlock_after_recovery starts the next one from the boundary the
+  # director chooses.
+  defp resume_after_cutover(%State{mode: :locked} = t, _durable_version), do: t
+  defp resume_after_cutover(%State{} = t, durable_version), do: Logic.resume_pulling_from(t, durable_version)
+
   defp do_finish_startup(otp_name, foreman, id, path, opts) do
     # Set persistent telemetry metadata for this server
     Telemetry.trace_metadata(%{otp_name: otp_name, storage_id: id})
@@ -568,7 +575,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
     # Resume: a fresh puller joins the stream at the durable boundary and
     # re-delivers everything after it through the normal apply path.
-    noreply(Logic.resume_pulling_from(new_state, durable_version))
+    noreply(resume_after_cutover(new_state, durable_version))
   end
 
   @impl true
