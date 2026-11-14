@@ -15,6 +15,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
   """
   use ExUnit.Case, async: true
 
+  alias Bedrock.DataPlane.Materializer.Olivine.CompactionPolicy
   alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.Index
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
@@ -377,6 +378,153 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
 
     assert %{mode: :locked, pull_task: nil} = :sys.get_state(pid)
   end
+
+  # Concurrent ingest across a cutover, for every mutation kind the replay
+  # must re-apply exactly once: a set, a clear_range that removes keys the
+  # durable snapshot still holds, and a read-modify-write atomic.
+  test "a cutover under concurrent ingest loses and duplicates nothing for set, clear_range and atomics",
+       %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    [v1, v2, v3, v4, v5, v6] = Enum.map(1..6, &Version.from_integer(&1 * 1_000))
+
+    :ok =
+      ReplayShardServer.append(shard_server, v1, encode([{:set, "c1", "v"}, {:set, "c2", "v"}, {:set, "c3", "v"}], v1))
+
+    :ok = ReplayShardServer.append(shard_server, v2, add_slice(v2, "ctr", 1))
+    await_counter(pid, v2, 1)
+
+    {:ok, task} = Logic.start_compaction(:sys.get_state(pid))
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    # The suffix, ingested while the compaction is open. (The clear stops short
+    # of c3 whichever way its end bound is read: Olivine's range filter is
+    # end-inclusive today, a separate question from the cutover.)
+    :ok = ReplayShardServer.append(shard_server, v3, encode([{:clear_range, "c1", <<"c2", 0xFF>>}], v3))
+    :ok = ReplayShardServer.append(shard_server, v4, add_slice(v4, "ctr", 10))
+    :ok = ReplayShardServer.append(shard_server, v5, encode([{:set, "n1", "v"}], v5))
+    await_key(pid, v5, "n1")
+
+    send(pid, cutover_msg)
+
+    # More ingest after the cutover, so the replay and new data interleave.
+    :ok = ReplayShardServer.append(shard_server, v6, add_slice(v6, "ctr", 100))
+    await_counter(pid, v6, 111)
+
+    assert {:error, :not_found} = GenServer.call(pid, {:get, "c1", v6, []})
+    assert {:error, :not_found} = GenServer.call(pid, {:get, "c2", v6, []})
+    assert {:ok, "v"} = GenServer.call(pid, {:get, "c3", v6, []})
+    assert {:ok, "v"} = GenServer.call(pid, {:get, "n1", v6, []})
+    assert {:ok, %{n_keys: 3}} = GenServer.call(pid, {:info, [:n_keys]})
+  end
+
+  describe "the compaction policy on window advance" do
+    # Driven through Server callbacks on a Logic state, as the ngl tests are;
+    # Logic.start_compaction/1 reports to self(), so the test receives the
+    # cutover message the server would.
+    test "compacts once past the bound, and not again below the new bound", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_past"), %CompactionPolicy{ratio: 1_000, floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert %Task{} = task = state.compaction_task
+      refute state.allow_window_advancement
+
+      assert_receive {:compaction_ready, _, _, _, _, _, index_offset, _, _, _, _, _} = cutover_msg, 10_000
+      Task.await(task)
+      {:noreply, state} = Server.handle_info(cutover_msg, state)
+
+      assert state.last_compacted_index_bytes == index_offset
+      assert state.compaction_task == nil
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_transaction(state, "k4", 40_000_000))
+      assert state.compaction_task == nil
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "does not compact below the bound", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_below"), %CompactionPolicy{floor_bytes: 1_000_000_000})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert state.compaction_task == nil
+      assert state.allow_window_advancement
+      assert Database.durable_version(state.database) == Version.from_integer(20_000_000)
+
+      Logic.shutdown(state)
+    end
+
+    test "never compacts a locked worker", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_locked"), %CompactionPolicy{floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(%{state | mode: :locked}))
+      assert state.compaction_task == nil
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "never starts a second compaction while one is open", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_open"), %CompactionPolicy{floor_bytes: 1})
+      open = %Task{pid: self(), ref: make_ref(), owner: self(), mfa: {:erlang, :self, 0}}
+
+      # The guard is independent of allow_window_advancement.
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(%{state | compaction_task: open}))
+      assert state.compaction_task == open
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "the :timeout path never advances while the triggered compaction is open", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_defer"), %CompactionPolicy{floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert %Task{} = task = state.compaction_task
+      durable = Database.durable_version(state.database)
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_transaction(state, "k4", 40_000_000))
+      {:noreply, state} = Server.handle_continue(:advance_window, state)
+
+      assert Database.durable_version(state.database) == durable
+      assert version_present?(state, durable)
+      assert state.index_manager.current_version == Version.from_integer(40_000_000)
+
+      assert_receive {:compaction_ready, _, _, _, _, _, _, _, ^durable, _, _, _}, 10_000
+      Task.await(task)
+      Logic.shutdown(state)
+    end
+  end
+
+  test "the compaction policy reads its knobs from manifest params" do
+    assert %CompactionPolicy{ratio: 4, floor_bytes: 67_108_864} = CompactionPolicy.from_params(%{})
+
+    assert %CompactionPolicy{ratio: 8, floor_bytes: 1024} =
+             CompactionPolicy.from_params(%{"compaction_index_ratio" => 8, "compaction_index_floor_bytes" => 1024})
+
+    assert %CompactionPolicy{ratio: 4} = CompactionPolicy.from_params(%{"compaction_index_ratio" => "8"})
+    assert CompactionPolicy.bound(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 10) == 100
+    assert CompactionPolicy.bound(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 50) == 200
+    refute CompactionPolicy.due?(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 200, 50)
+    assert CompactionPolicy.due?(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 201, 50)
+  end
+
+  defp running(state, policy), do: %{state | mode: :running, compaction_policy: policy}
+
+  defp queue_transaction(state, key, version_int) do
+    %{
+      state
+      | intake_queue: IntakeQueue.add_transactions(state.intake_queue, [commit(key, "v", version_int)]),
+        known_committed_version: Version.from_integer(version_int)
+    }
+  end
+
+  defp encode(mutations, version), do: Transaction.encode(%{mutations: mutations, commit_version: version})
 
   defp sets(prefix, range),
     do: Enum.map(range, &{:set, prefix <> String.pad_leading(Integer.to_string(&1), 4, "0"), "v"})

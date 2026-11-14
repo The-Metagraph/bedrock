@@ -6,6 +6,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
   alias Bedrock.DataPlane.CommitProxy
   alias Bedrock.DataPlane.Materializer
+  alias Bedrock.DataPlane.Materializer.Olivine.CompactionPolicy
   alias Bedrock.DataPlane.Materializer.Olivine.DataDatabase
   alias Bedrock.DataPlane.Materializer.Olivine.Index
   alias Bedrock.DataPlane.Materializer.Olivine.IndexDatabase
@@ -72,7 +73,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
       cluster: cluster,
       shard_id: params["shard_id"],
       snapshot_policy: SnapshotPolicy.from_params(params),
-      snapshot_retention: SnapshotRetention.from_params(params)
+      snapshot_retention: SnapshotRetention.from_params(params),
+      compaction_policy: CompactionPolicy.from_params(params)
     ]
 
     case params["idle_timeout"] do
@@ -248,11 +250,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   end
 
   @impl true
-  def handle_call(:compact, _from, %State{} = t) do
-    {:ok, task} = Logic.start_compaction(t)
-    updated_state = %{t | compaction_task: task, allow_window_advancement: false}
-    reply(updated_state, :ok)
-  end
+  def handle_call(:compact, _from, %State{} = t), do: t |> begin_compaction() |> reply(:ok)
 
   @impl true
   def handle_call(_, _from, t), do: reply(t, {:error, :not_ready})
@@ -315,19 +313,40 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     end
   end
 
-  def handle_continue(:advance_window, %State{} = t), do: noreply(maybe_advance_window(t))
+  def handle_continue(:advance_window, %State{} = t), do: noreply(advance_window_and_maybe_compact(t))
 
+  # Both window-advance sites come through here.
+  #
   # A compaction labels its output with the durable version it captured at
   # start_compaction/1, and the cutover looks exactly that version up in
   # `versions` to recover the index's paging parameters. Advancing the
   # window evicts every entry below the new eviction point and carries
   # index_db.durable_version up with it, so an advance while a compaction is
-  # open takes the cutover's anchor away. Both advance sites defer.
-  defp maybe_advance_window(%State{allow_window_advancement: false} = t), do: t
+  # open takes the cutover's anchor away (bedrock-ngl): skip it.
+  #
+  # An advance is also the only place the index file grows, so it is where
+  # the compaction trigger lives (bedrock-947): once the index exceeds the
+  # policy's bound relative to the last compacted size, start one — never on
+  # a locked worker (its cutover could not resume a puller) and never with
+  # one already open.
+  defp advance_window_and_maybe_compact(%State{allow_window_advancement: false} = t), do: t
 
-  defp maybe_advance_window(%State{} = t) do
-    {:ok, state_after_window} = Logic.advance_window(t)
-    state_after_window
+  defp advance_window_and_maybe_compact(%State{} = t) do
+    {:ok, t} = Logic.advance_window(t)
+    if compaction_due?(t), do: begin_compaction(t), else: t
+  end
+
+  defp compaction_due?(%State{mode: :locked}), do: false
+  defp compaction_due?(%State{compaction_task: task}) when not is_nil(task), do: false
+
+  defp compaction_due?(%State{database: {_data_db, index_db}} = t),
+    do: CompactionPolicy.due?(t.compaction_policy, index_db.file_offset, t.last_compacted_index_bytes)
+
+  # The one place a compaction starts, for the explicit :compact call and the
+  # policy trigger alike.
+  defp begin_compaction(%State{} = t) do
+    {:ok, task} = Logic.start_compaction(t)
+    %{t | compaction_task: task, allow_window_advancement: false}
   end
 
   # A worker a recovery locked while the compaction ran must stay quiet
@@ -439,7 +458,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
         state_after_txns = notify_waiting_fetches(state_with_txns, version)
 
         # Now advance window after processing transactions
-        noreply(maybe_advance_window(state_after_txns), continue: :maybe_process_transactions)
+        noreply(advance_window_and_maybe_compact(state_after_txns), continue: :maybe_process_transactions)
     end
   end
 
@@ -456,20 +475,20 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     noreply(updated_state)
   end
 
+  # Atomic cutover to compacted files
+  # The cutover rewinds the index to the durable snapshot, so the
+  # running puller's position (and any batch it has in flight) is
+  # meaningless. Stop it first — releasing a backpressure-parked ingest
+  # reply on the way — and rejoin the stream at the durable boundary
+  # once the new state is built. The stream re-delivers everything
+  # ingested during compaction; nothing is lost and nothing special
+  # remembers it.
   @impl true
   def handle_info(
         {:compaction_ready, compact_data_fd, compact_idx_fd, compact_data_path, compact_idx_path, new_data_offset,
          index_offset, compacted_pages, durable_version, duration, data_size_before, index_size_before},
         %State{} = t
       ) do
-    # Atomic cutover to compacted files
-    # The cutover rewinds the index to the durable snapshot, so the
-    # running puller's position (and any batch it has in flight) is
-    # meaningless. Stop it first — releasing a backpressure-parked ingest
-    # reply on the way — and rejoin the stream at the durable boundary
-    # once the new state is built. The stream re-delivers everything
-    # ingested during compaction; nothing is lost and nothing special
-    # remembers it.
     t = Logic.stop_pulling(t)
 
     {data_db, index_db} = t.database
@@ -557,7 +576,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
         index_manager: new_index_manager,
         intake_queue: IntakeQueue.new(),
         compaction_task: nil,
-        allow_window_advancement: true
+        allow_window_advancement: true,
+        last_compacted_index_bytes: index_offset
     }
 
     # Emit completion telemetry

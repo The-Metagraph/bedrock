@@ -3,6 +3,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.State do
 
   alias Bedrock.ControlPlane.Director
   alias Bedrock.DataPlane.Log
+  alias Bedrock.DataPlane.Materializer.Olivine.CompactionPolicy
   alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
   alias Bedrock.DataPlane.Materializer.Olivine.IntakeQueue
@@ -30,6 +31,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.State do
           window_lag_time_μs: non_neg_integer(),
           compaction_task: Task.t() | nil,
           allow_window_advancement: boolean(),
+          compaction_policy: CompactionPolicy.t(),
+          last_compacted_index_bytes: non_neg_integer(),
           snapshot: Snapshot.t() | nil,
           snapshot_policy: SnapshotPolicy.t(),
           snapshot_retention: SnapshotRetention.t(),
@@ -56,6 +59,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.State do
             window_lag_time_μs: 5_000_000,
             compaction_task: nil,
             allow_window_advancement: true,
+            compaction_policy: %CompactionPolicy{},
+            last_compacted_index_bytes: 0,
             snapshot: nil,
             snapshot_policy: %SnapshotPolicy{},
             snapshot_retention: %SnapshotRetention{},

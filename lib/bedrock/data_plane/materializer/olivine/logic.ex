@@ -6,6 +6,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
 
   alias Bedrock.ControlPlane.Director
   alias Bedrock.DataPlane.Materializer
+  alias Bedrock.DataPlane.Materializer.Olivine.CompactionPolicy
   alias Bedrock.DataPlane.Materializer.Olivine.CompactionWriter.SplitFile, as: SplitFileWriter
   alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
@@ -37,6 +38,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
 
     snapshot_policy = Keyword.get(opts, :snapshot_policy, %SnapshotPolicy{})
     snapshot_retention = Keyword.get(opts, :snapshot_retention, %SnapshotRetention{})
+    compaction_policy = Keyword.get(opts, :compaction_policy, %CompactionPolicy{})
     snapshot = build_snapshot_handle(cluster, shard_tag)
 
     with :ok <- ensure_directory_exists(path),
@@ -56,6 +58,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
          snapshot: snapshot,
          snapshot_policy: snapshot_policy,
          snapshot_retention: snapshot_retention,
+         compaction_policy: compaction_policy,
          idle_timeout: idle_timeout,
          last_read_at: System.monotonic_time(:millisecond)
        }}
