@@ -423,6 +423,49 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     assert {:ok, %{n_keys: 3}} = GenServer.call(pid, {:info, [:n_keys]})
   end
 
+  # The cutover's fresh IndexManager must measure the first replayed
+  # version from the end of the COMPACTED data file, as
+  # recover_from_database does. Measured from 0, that version's eviction
+  # size is the whole data file; once the file passes the 10 MiB eviction
+  # cap, nothing is ever evicted again — the durable version freezes, every
+  # version stays in memory, and the compaction trigger can never fire.
+  test "the window keeps advancing after a cutover whose data file exceeds the eviction cap",
+       %{tmp_dir: tmp_dir} do
+    otp_name = :"olivine_cutover_offset_#{System.unique_integer([:positive])}"
+    {:ok, state} = Logic.startup(otp_name, self(), "cutover-offset-worker", tmp_dir)
+
+    big = :binary.copy("v", 8_000)
+    # ~16 MB of live values across versions small enough to evict.
+    state =
+      Enum.reduce(1..8, state, fn i, state ->
+        apply_and_flush(state, for(n <- 1..250, do: {:set, "big#{i}-#{n}", big}), i * 10_000_000)
+      end)
+
+    {:ok, task} = Logic.start_compaction(state)
+    assert_receive {:compaction_ready, _, _, _, _, data_offset, _, _, durable, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+    assert data_offset > 10 * 1024 * 1024
+
+    {:noreply, state} = Server.handle_info(cutover_msg, state)
+    assert state.index_manager.last_version_ended_at_offset == data_offset
+
+    state = apply_and_flush(state, [{:set, "after1", "v"}], 100_000_000)
+    state = apply_and_flush(state, [{:set, "after2", "v"}], 200_000_000)
+
+    assert Database.durable_version(state.database) > durable
+    durable_after = Database.durable_version(state.database)
+
+    # What the post-cutover evictions wrote is readable from disk.
+    Logic.shutdown(state)
+    {:ok, reopened} = Logic.startup(:"#{otp_name}_reopen", self(), "cutover-offset-worker", tmp_dir)
+    assert Database.durable_version(reopened.database) == durable_after
+    # Seven batches were durable at the compaction; the eighth sat above the
+    # boundary and, with no stream here to re-deliver it, is not replayed.
+    # Then "after1" (after2 is still inside the window).
+    assert IndexManager.info(reopened.index_manager, :n_keys) == 7 * 250 + 1
+    Logic.shutdown(reopened)
+  end
+
   describe "the compaction policy on window advance" do
     # Driven through Server callbacks on a Logic state, as the ngl tests are;
     # Logic.start_compaction/1 reports to self(), so the test receives the

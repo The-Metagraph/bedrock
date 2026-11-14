@@ -485,7 +485,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   # remembers it.
   @impl true
   def handle_info(
-        {:compaction_ready, compact_data_fd, compact_idx_fd, compact_data_path, compact_idx_path, new_data_offset,
+        {:compaction_ready, _compact_data_fd, _compact_idx_fd, compact_data_path, compact_idx_path, new_data_offset,
          index_offset, compacted_pages, durable_version, duration, data_size_before, index_size_before},
         %State{} = t
       ) do
@@ -514,10 +514,18 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     :ok = :file.delete(old_data_path)
     :ok = :file.delete(old_idx_path)
 
+    # Reopen the installed files here. The descriptors in the message were
+    # opened write-only by the compaction task, which owns them: this
+    # process may not write through them (:not_on_controlling_process), and
+    # they close when the task exits. The first eviction after the cutover
+    # would crash the worker on them.
+    {:ok, data_fd} = :file.open(data_path, [:raw, :binary, :read, :write])
+    {:ok, idx_fd} = :file.open(idx_path, [:raw, :binary, :read, :write])
+
     # Build new database structures from compacted files
     # File name is now the original path (we renamed compact to replace it)
     new_data_db = %DataDatabase{
-      file: compact_data_fd,
+      file: data_fd,
       file_offset: new_data_offset,
       file_name: data_path,
       window_size_in_microseconds: 5_000_000,
@@ -525,7 +533,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     }
 
     new_index_db = %IndexDatabase{
-      file: compact_idx_fd,
+      file: idx_fd,
       file_offset: index_offset,
       file_name: idx_path,
       durable_version: durable_version,
@@ -561,7 +569,10 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
       # allocator has since recycled, and a split would write over one.
       id_allocator: Index.id_allocator(new_index),
       output_queue: :queue.new(),
-      last_version_ended_at_offset: 0,
+      # Measured from the end of the compacted data file, as
+      # recover_from_database does: from 0, the first replayed version would
+      # weigh the whole file and, past the eviction cap, never evict.
+      last_version_ended_at_offset: new_data_offset,
       window_lag_time_μs: 5_000_000,
       # The cutover rewinds to the durable snapshot and the stream re-delivers
       # everything ingested since, so the count must rewind with it: carrying
