@@ -75,14 +75,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
     durable_version = Database.durable_version(database)
 
     case Index.load_from(database) do
-      {:ok, initial_index, max_id, free_ids, n_keys} ->
+      {:ok, initial_index, id_allocator, n_keys} ->
         {data_db, _index_db} = database
 
         index_manager = %__MODULE__{
           versions: [{durable_version, {initial_index, %{}}}],
           current_version: durable_version,
           window_size_in_microseconds: 5_000_000,
-          id_allocator: IdAllocator.new(max_id, free_ids),
+          id_allocator: id_allocator,
           last_version_ended_at_offset: data_db.file_offset,
           n_keys: n_keys
         }
@@ -196,8 +196,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
 
     {new_index, new_database, new_id_allocator, modified_pages} = IndexUpdate.finish(update)
 
-    %{keys_added: keys_added, keys_removed: keys_removed, keys_changed: keys_changed} = update
-    new_n_keys = index_manager.n_keys + keys_added - keys_removed
+    %{key_count_delta: key_count_delta} = update
+    new_n_keys = index_manager.n_keys + key_count_delta
 
     {updated_data_db, _} = new_database
     this_version_ended_at_offset = updated_data_db.file_offset
@@ -211,7 +211,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
         index_manager.output_queue
       )
 
-    Telemetry.trace_index_update_complete(keys_added, keys_removed, keys_changed, new_n_keys)
+    Telemetry.trace_index_update_complete(key_count_delta, new_n_keys)
 
     {%{
        index_manager
@@ -257,16 +257,32 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
   end
 
   @spec get_key_ranges(t()) :: [{Bedrock.key(), Bedrock.key()}]
-  defp get_key_ranges(%{versions: [{_, {current_index, _}} | _]}), do: [{current_index.min_key, current_index.max_key}]
+  defp get_key_ranges(%{versions: [{_, {current_index, _}} | _]}), do: [Index.key_bounds(current_index)]
   defp get_key_ranges(%{versions: []}), do: []
 
   @doc """
-  Extracts the complete page_map from the current version's index.
-  Used during compaction to get all current pages.
+  Extracts the complete page_map AT `version`. Used during compaction.
+
+  Compaction labels its output with the durable version, so it must be
+  handed the page map at that version and not the live one: a page
+  carrying an effect from above the durable boundary would be stamped
+  durable at a version below its own contents, and the cutover's replay —
+  which rejoins the stream above the boundary — would apply that
+  transaction a second time.
+
+  The match is exact, not `index_for_version/2`'s nearest-at-or-below:
+  the whole point is that the label and the contents agree, and an older
+  page map silently substituted would label the files ABOVE their
+  contents and make the replay skip transactions instead.
   """
-  @spec get_complete_page_map(t()) :: %{Page.id() => {Page.t(), Page.id()}}
-  def get_complete_page_map(%{versions: [{_, {current_index, _}} | _]}), do: current_index.page_map
-  def get_complete_page_map(%{versions: []}), do: %{}
+  @spec page_map_at(t(), Bedrock.version()) :: %{Page.id() => {Page.t(), Page.id()}}
+  def page_map_at(%{versions: versions}, version) do
+    # Only ever asked for the durable version, which is the oldest entry
+    # in the list: eviction advances the entry and the database's durable
+    # version together, and no rollback goes below it.
+    {_version, {%Index{page_map: page_map}, _modified}} = Enum.find(versions, &match?({^version, _}, &1))
+    page_map
+  end
 
   @spec index_for_version(version_list(), Bedrock.version()) :: Index.t() | nil
   defp index_for_version(versions, target), do: find_target(versions, target)
@@ -496,9 +512,19 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
   Disk is untouched, and never needs to be: eviction is clamped to the
   known-committed version, and a recovery version is always at or above the
   known-committed version at the moment of the crash, so everything durable
-  survives every rollback. (Statistics such as `n_keys` are left as-is; the
-  data-file offset is not rewound, so orphaned bytes linger until the next
-  compaction.)
+  survives every rollback. (The data-file offset is not rewound, so orphaned
+  bytes linger until the next compaction.)
+
+  `n_keys` rewinds with the index: the resumed stream re-delivers the
+  discarded suffix, and a count carried across the rollback would tally
+  those transactions twice.
+
+  So does the id allocator, and for a sharper reason: a clear in the
+  discarded suffix recycled the ids of the pages it emptied, and the
+  rollback brings those pages back to life. A carried-over allocator would
+  still list their ids as free and the next split would write over a live
+  page — so the allocator is re-derived from the index being installed
+  (`Index.id_allocator/1`).
   """
   @spec rollback_to(t(), Bedrock.version()) :: t()
   def rollback_to(%{current_version: current} = index_manager, version) when current <= version, do: index_manager
@@ -507,11 +533,19 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
     # Newest-first: drop entries above the target. The base (durable)
     # entry is always at or below any legitimate rollback target, so the
     # list can never empty — a crash here means corrupted state.
-    [{new_current, _} | _] = versions = Enum.drop_while(index_manager.versions, fn {v, _} -> v > version end)
+    [{new_current, {new_index, _}} | _] =
+      versions = Enum.drop_while(index_manager.versions, fn {v, _} -> v > version end)
 
     output_queue = :queue.filter(fn {v, _, _, _} -> v <= version end, index_manager.output_queue)
 
-    %{index_manager | versions: versions, current_version: new_current, output_queue: output_queue}
+    %{
+      index_manager
+      | versions: versions,
+        current_version: new_current,
+        output_queue: output_queue,
+        id_allocator: Index.id_allocator(new_index),
+        n_keys: Index.key_count(new_index)
+    }
   end
 
   defp split_versions([{version, _data} = entry | rest], target, kept_versions) when version >= target,

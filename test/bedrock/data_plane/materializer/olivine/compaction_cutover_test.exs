@@ -8,9 +8,18 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
   bookkeeping, but the same way recovery restores a suffix: the stream
   puller is stopped and restarted from the durable boundary, and the
   stream re-delivers everything after it.
+
+  It also guards the cutover's precondition (bedrock-ngl): the durable
+  version the compaction captured must still be in `versions` when the
+  cutover arrives, so no window advance may run while a compaction is open.
   """
   use ExUnit.Case, async: true
 
+  alias Bedrock.DataPlane.Materializer.Olivine.CompactionPolicy
+  alias Bedrock.DataPlane.Materializer.Olivine.Database
+  alias Bedrock.DataPlane.Materializer.Olivine.Index
+  alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
+  alias Bedrock.DataPlane.Materializer.Olivine.IntakeQueue
   alias Bedrock.DataPlane.Materializer.Olivine.Logic
   alias Bedrock.DataPlane.Materializer.Olivine.Server
   alias Bedrock.DataPlane.Transaction
@@ -109,6 +118,26 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     Transaction.encode(%{mutations: [{:set, "key", value}], commit_version: version})
   end
 
+  # One new key per version, so a version applied twice is visible in the count.
+  defp distinct_slice(version, key) do
+    Transaction.encode(%{mutations: [{:set, key, "v"}], commit_version: version})
+  end
+
+  # A read-modify-write, unlike every other slice here: applying it twice
+  # lands on a different value than applying it once.
+  defp add_slice(version, key, amount) do
+    Transaction.encode(%{mutations: [{:atomic, :add, key, <<amount::little-64>>}], commit_version: version})
+  end
+
+  defp await_key(pid, version, key) do
+    assert {:ok, "v"} = GenServer.call(pid, {:get, key, version, [wait_ms: 15_000]}, 20_000)
+  end
+
+  defp await_counter(pid, version, expected) do
+    assert {:ok, <<^expected::little-64>>} =
+             GenServer.call(pid, {:get, "ctr", version, [wait_ms: 15_000]}, 20_000)
+  end
+
   # Generous waits: under full-suite parallelism the stream round-trips
   # (discovery, pull, apply, read wake-up) share cores with everything else.
   defp await_value(pid, version, expected) do
@@ -177,6 +206,78 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     assert_pulls_monotonic(resumed_from)
   end
 
+  # The rewind is the whole point of the cutover, so the key count has to
+  # rewind with it: the replayed suffix adds its keys a second time, and a
+  # count carried over from the live index would count them twice.
+  test "the key count rewinds with the index and is rebuilt by the replay",
+       %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    v1000 = Version.from_integer(1_000)
+    v2000 = Version.from_integer(2_000)
+    v3000 = Version.from_integer(3_000)
+
+    :ok = ReplayShardServer.append(shard_server, v1000, distinct_slice(v1000, "k1"))
+    await_key(pid, v1000, "k1")
+
+    state = :sys.get_state(pid)
+    {:ok, task} = Logic.start_compaction(state)
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    :ok = ReplayShardServer.append(shard_server, v2000, distinct_slice(v2000, "k2"))
+    :ok = ReplayShardServer.append(shard_server, v3000, distinct_slice(v3000, "k3"))
+    await_key(pid, v3000, "k3")
+
+    assert {:ok, %{n_keys: 3}} = GenServer.call(pid, {:info, [:n_keys]})
+
+    send(pid, cutover_msg)
+
+    # After the replay all three keys are back — and counted exactly once.
+    await_key(pid, v3000, "k3")
+    assert {:ok, %{n_keys: 3}} = GenServer.call(pid, {:info, [:n_keys]})
+    assert {:ok, %{key_ranges: [{"k1", "k3"}]}} = GenServer.call(pid, {:info, [:key_ranges]})
+  end
+
+  # The compacted files are labelled with the durable version, so they must
+  # hold the durable page map and nothing above it: the cutover rewinds to
+  # that boundary and the stream re-delivers everything after it. A page
+  # carrying an effect from above the boundary gets that effect applied a
+  # second time on top of itself — invisible for an idempotent set, a
+  # doubled increment for an atomic.
+  test "an atomic applied above the durable boundary is not applied twice by the replay",
+       %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    v1000 = Version.from_integer(1_000)
+    v2000 = Version.from_integer(2_000)
+
+    :ok = ReplayShardServer.append(shard_server, v1000, add_slice(v1000, "ctr", 1))
+    await_counter(pid, v1000, 1)
+
+    state = :sys.get_state(pid)
+    {:ok, task} = Logic.start_compaction(state)
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    send(pid, cutover_msg)
+
+    # A marker below which the whole replayed suffix has landed: the stream
+    # is ordered, so v2000 being readable means v1000 was applied first.
+    :ok = ReplayShardServer.append(shard_server, v2000, distinct_slice(v2000, "marker"))
+    await_key(pid, v2000, "marker")
+
+    await_counter(pid, v2000, 1)
+  end
+
   test "a superseded puller's queued ingest is acknowledged and discarded",
        %{tmp_dir: tmp_dir} do
     {:ok, shard_server} = ReplayShardServer.start_link(self())
@@ -204,6 +305,367 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     :ok = ReplayShardServer.append(shard_server, v2000, slice(v2000, "b"))
     await_value(pid, v2000, "b")
   end
+
+  # The cutover installs the DURABLE page map, and that map still holds
+  # pages the live allocator has since recycled. A carried-over allocator
+  # lists them as free; the replay then recycles the same ids a SECOND
+  # time, and a later multi-way split hands one id to two new pages —
+  # `add_pages_batch` keeps only the last, and the other page's keys are
+  # gone.
+  #
+  # Driven through Logic rather than a live server: the durable boundary
+  # has to advance past a recycling clear, which needs versions seconds
+  # apart and a known-committed version to uncap the window.
+  test "the id allocator rewinds with the compacted index", %{tmp_dir: tmp_dir} do
+    otp_name = :"olivine_cutover_alloc_#{System.unique_integer([:positive])}"
+    {:ok, state} = Logic.startup(otp_name, self(), "cutover-alloc-worker", tmp_dir)
+
+    # 300 keys overflow the 256-key page, splitting page 0 and allocating
+    # page 1. Nothing is evictable yet — the window edge underflows.
+    state = apply_and_flush(state, sets("k", 1..300), 10_000_000)
+
+    # Emptying page 1 recycles its id. This version's window advance makes
+    # the PREVIOUS one durable, so the durable page map still holds page 1.
+    state = apply_and_flush(state, [{:clear_range, "k0151", "l"}], 20_000_000)
+
+    durable = Database.durable_version(state.database)
+    assert Version.to_integer(durable) == 10_000_000
+    assert state.index_manager |> IndexManager.page_map_at(durable) |> Map.keys() |> Enum.sort() == [0, 1]
+    assert IndexManager.info(state.index_manager, :free_ids) == [1]
+
+    {:ok, task} = Logic.start_compaction(state)
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, ^durable, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    {:noreply, state} = Server.handle_info(cutover_msg, state)
+    assert IndexManager.info(state.index_manager, :free_ids) == []
+
+    # The replay: the stream re-delivers the clear, and then a transaction
+    # whose split needs two new page ids at once.
+    state = apply_transaction(state, [{:clear_range, "k0151", "l"}], 20_000_000)
+    state = apply_transaction(state, sets("j", 1..400), 30_000_000)
+
+    [{_version, {index, _modified}} | _] = state.index_manager.versions
+    assert IndexManager.info(state.index_manager, :n_keys) == Index.key_count(index)
+    assert IndexManager.info(state.index_manager, :n_keys) == 550
+
+    Logic.shutdown(state)
+  end
+
+  # bedrock-mk2: a recovery can lock the worker while its compaction runs.
+  # The cutover still installs the compacted files, but it must not start a
+  # puller — the locked worker's stream position belongs to the director,
+  # and unlock_after_recovery starts the next puller.
+  test "a cutover on a locked worker resumes no puller", %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    v1000 = Version.from_integer(1_000)
+    :ok = ReplayShardServer.append(shard_server, v1000, slice(v1000, "a"))
+    await_value(pid, v1000, "a")
+
+    {:ok, task} = Logic.start_compaction(:sys.get_state(pid))
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    {:ok, _pid, _info} = GenServer.call(pid, {:lock_for_recovery, 2})
+    assert %{mode: :locked, pull_task: nil} = :sys.get_state(pid)
+
+    send(pid, cutover_msg)
+
+    assert %{mode: :locked, pull_task: nil} = :sys.get_state(pid)
+  end
+
+  # Concurrent ingest across a cutover, for every mutation kind the replay
+  # must re-apply exactly once: a set, a clear_range that removes keys the
+  # durable snapshot still holds, and a read-modify-write atomic.
+  test "a cutover under concurrent ingest loses and duplicates nothing for set, clear_range and atomics",
+       %{tmp_dir: tmp_dir} do
+    {:ok, shard_server} = ReplayShardServer.start_link(self())
+    {:ok, log_stub} = StubLog.start_link(shard_server)
+
+    pid = start_worker(tmp_dir)
+    unlock_with_stream(pid, log_stub)
+
+    [v1, v2, v3, v4, v5, v6] = Enum.map(1..6, &Version.from_integer(&1 * 1_000))
+
+    :ok =
+      ReplayShardServer.append(shard_server, v1, encode([{:set, "c1", "v"}, {:set, "c2", "v"}, {:set, "c3", "v"}], v1))
+
+    :ok = ReplayShardServer.append(shard_server, v2, add_slice(v2, "ctr", 1))
+    await_counter(pid, v2, 1)
+
+    {:ok, task} = Logic.start_compaction(:sys.get_state(pid))
+    assert_receive {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+
+    # The suffix, ingested while the compaction is open. (The clear stops short
+    # of c3 whichever way its end bound is read: Olivine's range filter is
+    # end-inclusive today, a separate question from the cutover.)
+    :ok = ReplayShardServer.append(shard_server, v3, encode([{:clear_range, "c1", <<"c2", 0xFF>>}], v3))
+    :ok = ReplayShardServer.append(shard_server, v4, add_slice(v4, "ctr", 10))
+    :ok = ReplayShardServer.append(shard_server, v5, encode([{:set, "n1", "v"}], v5))
+    await_key(pid, v5, "n1")
+
+    send(pid, cutover_msg)
+
+    # More ingest after the cutover, so the replay and new data interleave.
+    :ok = ReplayShardServer.append(shard_server, v6, add_slice(v6, "ctr", 100))
+    await_counter(pid, v6, 111)
+
+    assert {:error, :not_found} = GenServer.call(pid, {:get, "c1", v6, []})
+    assert {:error, :not_found} = GenServer.call(pid, {:get, "c2", v6, []})
+    assert {:ok, "v"} = GenServer.call(pid, {:get, "c3", v6, []})
+    assert {:ok, "v"} = GenServer.call(pid, {:get, "n1", v6, []})
+    assert {:ok, %{n_keys: 3}} = GenServer.call(pid, {:info, [:n_keys]})
+  end
+
+  # The cutover's fresh IndexManager must measure the first replayed
+  # version from the end of the COMPACTED data file, as
+  # recover_from_database does. Measured from 0, that version's eviction
+  # size is the whole data file; once the file passes the 10 MiB eviction
+  # cap, nothing is ever evicted again — the durable version freezes, every
+  # version stays in memory, and the compaction trigger can never fire.
+  test "the window keeps advancing after a cutover whose data file exceeds the eviction cap",
+       %{tmp_dir: tmp_dir} do
+    otp_name = :"olivine_cutover_offset_#{System.unique_integer([:positive])}"
+    {:ok, state} = Logic.startup(otp_name, self(), "cutover-offset-worker", tmp_dir)
+
+    big = :binary.copy("v", 8_000)
+    # ~16 MB of live values across versions small enough to evict.
+    state =
+      Enum.reduce(1..8, state, fn i, state ->
+        apply_and_flush(state, for(n <- 1..250, do: {:set, "big#{i}-#{n}", big}), i * 10_000_000)
+      end)
+
+    {:ok, task} = Logic.start_compaction(state)
+    assert_receive {:compaction_ready, _, _, _, _, data_offset, _, _, durable, _, _, _} = cutover_msg, 10_000
+    Task.await(task)
+    assert data_offset > 10 * 1024 * 1024
+
+    {:noreply, state} = Server.handle_info(cutover_msg, state)
+    assert state.index_manager.last_version_ended_at_offset == data_offset
+
+    state = apply_and_flush(state, [{:set, "after1", "v"}], 100_000_000)
+    state = apply_and_flush(state, [{:set, "after2", "v"}], 200_000_000)
+
+    assert Database.durable_version(state.database) > durable
+    durable_after = Database.durable_version(state.database)
+
+    # What the post-cutover evictions wrote is readable from disk.
+    Logic.shutdown(state)
+    {:ok, reopened} = Logic.startup(:"#{otp_name}_reopen", self(), "cutover-offset-worker", tmp_dir)
+    assert Database.durable_version(reopened.database) == durable_after
+    # Seven batches were durable at the compaction; the eighth sat above the
+    # boundary and, with no stream here to re-deliver it, is not replayed.
+    # Then "after1" (after2 is still inside the window).
+    assert IndexManager.info(reopened.index_manager, :n_keys) == 7 * 250 + 1
+    Logic.shutdown(reopened)
+  end
+
+  describe "the compaction policy on window advance" do
+    # Driven through Server callbacks on a Logic state, as the ngl tests are;
+    # Logic.start_compaction/1 reports to self(), so the test receives the
+    # cutover message the server would.
+    test "compacts once past the bound, and not again below the new bound", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_past"), %CompactionPolicy{ratio: 1_000, floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert %Task{} = task = state.compaction_task
+      refute state.allow_window_advancement
+
+      assert_receive {:compaction_ready, _, _, _, _, _, index_offset, _, _, _, _, _} = cutover_msg, 10_000
+      Task.await(task)
+      {:noreply, state} = Server.handle_info(cutover_msg, state)
+
+      assert state.last_compacted_index_bytes == index_offset
+      assert state.compaction_task == nil
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_transaction(state, "k4", 40_000_000))
+      assert state.compaction_task == nil
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "does not compact below the bound", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_below"), %CompactionPolicy{floor_bytes: 1_000_000_000})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert state.compaction_task == nil
+      assert state.allow_window_advancement
+      assert Database.durable_version(state.database) == Version.from_integer(20_000_000)
+
+      Logic.shutdown(state)
+    end
+
+    test "never compacts a locked worker", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_locked"), %CompactionPolicy{floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(%{state | mode: :locked}))
+      assert state.compaction_task == nil
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "never starts a second compaction while one is open", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_open"), %CompactionPolicy{floor_bytes: 1})
+      open = %Task{pid: self(), ref: make_ref(), owner: self(), mfa: {:erlang, :self, 0}}
+
+      # The guard is independent of allow_window_advancement.
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(%{state | compaction_task: open}))
+      assert state.compaction_task == open
+      refute_received {:compaction_ready, _, _, _, _, _, _, _, _, _, _, _}
+
+      Logic.shutdown(state)
+    end
+
+    test "the :timeout path never advances while the triggered compaction is open", %{tmp_dir: tmp_dir} do
+      state = running(flushed_state(tmp_dir, "policy_defer"), %CompactionPolicy{floor_bytes: 1})
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_third_transaction(state))
+      assert %Task{} = task = state.compaction_task
+      durable = Database.durable_version(state.database)
+
+      {:noreply, state, _} = Server.handle_info(:timeout, queue_transaction(state, "k4", 40_000_000))
+      {:noreply, state} = Server.handle_continue(:advance_window, state)
+
+      assert Database.durable_version(state.database) == durable
+      assert version_present?(state, durable)
+      assert state.index_manager.current_version == Version.from_integer(40_000_000)
+
+      assert_receive {:compaction_ready, _, _, _, _, _, _, _, ^durable, _, _, _}, 10_000
+      Task.await(task)
+      Logic.shutdown(state)
+    end
+  end
+
+  test "the compaction policy reads its knobs from manifest params" do
+    assert %CompactionPolicy{ratio: 4, floor_bytes: 67_108_864} = CompactionPolicy.from_params(%{})
+
+    assert %CompactionPolicy{ratio: 8, floor_bytes: 1024} =
+             CompactionPolicy.from_params(%{"compaction_index_ratio" => 8, "compaction_index_floor_bytes" => 1024})
+
+    assert %CompactionPolicy{ratio: 4} = CompactionPolicy.from_params(%{"compaction_index_ratio" => "8"})
+    assert CompactionPolicy.bound(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 10) == 100
+    assert CompactionPolicy.bound(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 50) == 200
+    refute CompactionPolicy.due?(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 200, 50)
+    assert CompactionPolicy.due?(%CompactionPolicy{ratio: 4, floor_bytes: 100}, 201, 50)
+  end
+
+  defp running(state, policy), do: %{state | mode: :running, compaction_policy: policy}
+
+  defp queue_transaction(state, key, version_int) do
+    %{
+      state
+      | intake_queue: IntakeQueue.add_transactions(state.intake_queue, [commit(key, "v", version_int)]),
+        known_committed_version: Version.from_integer(version_int)
+    }
+  end
+
+  defp encode(mutations, version), do: Transaction.encode(%{mutations: mutations, commit_version: version})
+
+  defp sets(prefix, range),
+    do: Enum.map(range, &{:set, prefix <> String.pad_leading(Integer.to_string(&1), 4, "0"), "v"})
+
+  defp apply_transaction(state, mutations, version_int) do
+    encoded = Transaction.encode(%{mutations: mutations, commit_version: Version.from_integer(version_int)})
+    {:ok, state, _version} = Logic.apply_transactions(state, [encoded])
+    state
+  end
+
+  defp apply_and_flush(state, mutations, version_int) do
+    state = apply_transaction(state, mutations, version_int)
+    {:ok, state} = Logic.advance_window(%{state | known_committed_version: Version.from_integer(version_int)})
+    state
+  end
+
+  describe "window advancement while a compaction is open" do
+    # start_compaction/1 labels its output with the durable version at the
+    # moment it starts, and the cutover looks exactly that version up in
+    # `versions` to recover the index's paging parameters.
+    # A window advance evicts every entry below the new eviction point and
+    # carries index_db.durable_version up with it, so an advance while a
+    # compaction is open takes the cutover's anchor away.
+    #
+    # handle_continue(:advance_window, ...) has always deferred on
+    # allow_window_advancement; the :timeout path applies a batch and then
+    # advances, and must defer for the same reason.
+    test "the :timeout path defers the advance, leaving the compaction's durable version in place",
+         %{tmp_dir: tmp_dir} do
+      state = flushed_state(tmp_dir, "ngl_deferred")
+
+      # What start_compaction/1 captured when the operator asked to compact.
+      compaction_version = Database.durable_version(state.database)
+      assert Version.to_integer(compaction_version) > 0
+
+      {:noreply, after_timeout, _continue} =
+        Server.handle_info(:timeout, queue_third_transaction(%{state | allow_window_advancement: false}))
+
+      assert version_present?(after_timeout, compaction_version)
+      assert Database.durable_version(after_timeout.database) == compaction_version
+
+      # The batch still landed — compaction pauses the window, not ingest.
+      assert after_timeout.index_manager.current_version == Version.from_integer(30_000_000)
+
+      Logic.shutdown(after_timeout)
+    end
+
+    test "with no compaction open the :timeout path still advances the window", %{tmp_dir: tmp_dir} do
+      state = flushed_state(tmp_dir, "ngl_allowed")
+      durable_before = Database.durable_version(state.database)
+
+      {:noreply, after_timeout, _continue} = Server.handle_info(:timeout, queue_third_transaction(state))
+
+      assert Database.durable_version(after_timeout.database) == Version.from_integer(20_000_000)
+      refute version_present?(after_timeout, durable_before)
+
+      Logic.shutdown(after_timeout)
+    end
+  end
+
+  # Two applies five seconds (in version-time) apart: the second's window
+  # advance evicts the first, so the durable version is v10_000_000 and is
+  # the oldest entry still in `versions`.
+  defp flushed_state(tmp_dir, name) do
+    dir = Path.join(tmp_dir, name)
+    File.mkdir_p!(dir)
+
+    {:ok, state} = Logic.startup(:"olivine_#{name}_#{System.unique_integer([:positive])}", self(), name, dir, [])
+
+    state
+    |> apply_and_flush("k1", "v1", 10_000_000)
+    |> apply_and_flush("k2", "v2", 20_000_000)
+  end
+
+  defp apply_and_flush(state, key, value, version_int) do
+    {:ok, state, _version} = Logic.apply_transactions(state, [commit(key, value, version_int)])
+    {:ok, state} = Logic.advance_window(%{state | known_committed_version: Version.from_integer(version_int)})
+    state
+  end
+
+  # A third transaction, far enough above the second to make the window
+  # advanceable again, left in the intake queue so handle_info(:timeout, ...)
+  # takes the apply-then-advance branch rather than the empty-queue one.
+  defp queue_third_transaction(state) do
+    %{
+      state
+      | intake_queue: IntakeQueue.add_transactions(state.intake_queue, [commit("k3", "v3", 30_000_000)]),
+        known_committed_version: Version.from_integer(30_000_000)
+    }
+  end
+
+  defp commit(key, value, version_int) do
+    encoded = Transaction.encode(%{mutations: [{:set, key, value}], read_conflicts: {nil, []}, write_conflicts: []})
+    {:ok, with_version} = Transaction.add_commit_version(encoded, Version.from_integer(version_int))
+    with_version
+  end
+
+  defp version_present?(state, version), do: Enum.any?(state.index_manager.versions, fn {v, _} -> v == version end)
 
   defp flush_pulls do
     receive do

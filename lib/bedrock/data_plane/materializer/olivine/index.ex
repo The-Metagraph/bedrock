@@ -71,8 +71,6 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
   @type t :: %__MODULE__{
           tree: :gb_trees.tree(),
           page_map: map(),
-          min_key: Bedrock.key(),
-          max_key: Bedrock.key(),
           max_keys_per_page: pos_integer(),
           target_keys_per_page: pos_integer()
         }
@@ -80,8 +78,6 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
   defstruct [
     :tree,
     :page_map,
-    :min_key,
-    :max_key,
     max_keys_per_page: @default_max_keys_per_page,
     target_keys_per_page: div(@default_max_keys_per_page * 9, 10)
   ]
@@ -104,8 +100,6 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
     %__MODULE__{
       tree: initial_tree,
       page_map: initial_page_map,
-      min_key: <<0xFF, 0xFF>>,
-      max_key: <<>>,
       max_keys_per_page: max_keys,
       target_keys_per_page: target_keys
     }
@@ -123,14 +117,47 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
   end
 
   @doc """
+  The number of keys the index currently holds, counted from the page headers.
+  """
+  @spec key_count(t()) :: non_neg_integer()
+  def key_count(%__MODULE__{page_map: page_map}),
+    do: Enum.reduce(page_map, 0, fn {_page_id, {page, _next_id}}, total -> total + Page.key_count(page) end)
+
+  @doc """
+  The smallest and largest keys the index currently holds, computed from the
+  pages rather than cached: nothing on the mutation path is cheap enough to
+  maintain a running minimum, and a cached bound that mutations do not update
+  is a stale bound. Callers are info/telemetry paths, not the hot path.
+
+  An index with no keys reports the inverted sentinel `{<<0xFF, 0xFF>>, <<>>}`
+  — an empty range, distinguishable from any real one.
+  """
+  @spec key_bounds(t()) :: {Bedrock.key(), Bedrock.key()}
+  def key_bounds(%__MODULE__{page_map: page_map}) do
+    page_map
+    |> Enum.flat_map(fn {_page_id, {page, _next_id}} ->
+      # A page holds no keys or holds at least one, so the bounds are both
+      # nil or neither is: a half-nil pair has no shape here.
+      case {Page.left_key(page), Page.right_key(page)} do
+        {nil, nil} -> []
+        {left_key, right_key} -> [left_key, right_key]
+      end
+    end)
+    |> case do
+      [] -> {<<0xFF, 0xFF>>, <<>>}
+      keys -> Enum.min_max(keys)
+    end
+  end
+
+  @doc """
   Loads an Index from the database by traversing the page chain and building the tree structure.
-  Returns {:ok, index, max_id, free_ids, total_key_count} or an error.
+  Returns {:ok, index, id_allocator, total_key_count} or an error.
 
   ## Options
   - `max_keys_per_page` - Maximum keys per page (default: #{@default_max_keys_per_page})
   """
   @spec load_from(Database.t(), keyword()) ::
-          {:ok, t(), Page.id(), [Page.id()], non_neg_integer()}
+          {:ok, t(), IdAllocator.t(), non_neg_integer()}
           | {:error, :missing_pages | {:corrupt_index, term()}}
   def load_from({_data_db, index_db}, opts \\ []) do
     {:ok, durable_version} = IndexDatabase.load_durable_version(index_db)
@@ -138,7 +165,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
     target_keys = div(max_keys * 3, 4)
 
     if durable_version == Version.zero() do
-      {:ok, new(opts), 0, [], 0}
+      {:ok, new(opts), IdAllocator.new(0, []), 0}
     else
       needed_page_ids = MapSet.new([0])
 
@@ -393,12 +420,11 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
   end
 
   @spec build_index_from_page_map(%{Page.id() => {Page.t(), Page.id()}}, pos_integer(), pos_integer()) ::
-          {:ok, t(), Page.id(), [Page.id()], non_neg_integer()}
+          {:ok, t(), IdAllocator.t(), non_neg_integer()}
   defp build_index_from_page_map(page_map, max_keys_per_page, target_keys_per_page) do
     tree = Tree.from_page_map(page_map)
     page_ids = page_map |> Map.keys() |> MapSet.new()
     max_id = if MapSet.size(page_ids) > 0, do: Enum.max(page_ids), else: 0
-    free_ids = calculate_free_ids(max_id, page_ids)
 
     initial_page_map =
       if :gb_trees.is_empty(tree) and max_id == 0 do
@@ -408,23 +434,35 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
         page_map
       end
 
-    {min_key, max_key} = calculate_key_bounds(tree, initial_page_map)
-
-    total_key_count =
-      initial_page_map
-      |> Enum.map(fn {_, {page, _next_id}} -> Page.key_count(page) end)
-      |> Enum.sum()
-
     index = %__MODULE__{
       tree: tree,
       page_map: initial_page_map,
-      min_key: min_key,
-      max_key: max_key,
       max_keys_per_page: max_keys_per_page,
       target_keys_per_page: target_keys_per_page
     }
 
-    {:ok, index, max_id, free_ids, total_key_count}
+    {:ok, index, id_allocator(index), key_count(index)}
+  end
+
+  @doc """
+  The allocator implied by an index's page map: `max_id` is the largest page
+  id in use, and every id below it that no page holds is free.
+
+  This is the only allocator an index may be paired with. Anywhere an older
+  index is installed — a recovery rollback, the compaction cutover, a load
+  from disk — the allocator must be re-derived from the map going in rather
+  than carried across from the state being discarded. A clear above the
+  rewind point recycles the ids of the pages it empties; the rewind brings
+  those pages back to life, and a carried-over allocator would still list
+  their ids as free. The next split would take one and write a new page
+  straight over a live one.
+  """
+  @spec id_allocator(t()) :: IdAllocator.t()
+  def id_allocator(%__MODULE__{page_map: page_map}) do
+    # Page 0 always exists (invariant 1), so the set is never empty.
+    page_ids = page_map |> Map.keys() |> MapSet.new()
+    max_id = Enum.max(page_ids)
+    IdAllocator.new(max_id, calculate_free_ids(max_id, page_ids))
   end
 
   defp calculate_free_ids(0, _all_existing_page_ids), do: []
@@ -787,35 +825,6 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
       :none ->
         # Reached end without finding target page
         nil
-    end
-  end
-
-  # Helper function to calculate min/max keys efficiently
-  defp calculate_key_bounds(tree, page_map) do
-    if :gb_trees.is_empty(tree) do
-      {<<0xFF, 0xFF>>, <<>>}
-    else
-      # Get max from tree structure (O(log n) operation)
-      {max_tree_key, _max_id} = :gb_trees.largest(tree)
-
-      # For min_key, we need to find the actual smallest first_key across all pages
-      # This is a one-time calculation during load
-      min_key = find_minimum_first_key(page_map)
-
-      {min_key, max_tree_key}
-    end
-  end
-
-  # Find the minimum first_key across all pages (only used during load)
-  defp find_minimum_first_key(page_map) when map_size(page_map) == 0, do: <<0xFF, 0xFF>>
-
-  defp find_minimum_first_key(page_map) do
-    page_map
-    |> Enum.map(fn {_page_id, {page, _next_id}} -> Page.left_key(page) end)
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> <<0xFF, 0xFF>>
-      keys -> Enum.min(keys)
     end
   end
 end

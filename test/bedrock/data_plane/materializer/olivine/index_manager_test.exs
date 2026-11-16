@@ -5,6 +5,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManagerTest do
 
   alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.IdAllocator
+  alias Bedrock.DataPlane.Materializer.Olivine.Index
   alias Bedrock.DataPlane.Materializer.Olivine.Index.Page
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
   alias Bedrock.DataPlane.Transaction
@@ -50,6 +51,11 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManagerTest do
     Transaction.encode(transaction_map)
   end
 
+  defp sets(prefix, range),
+    do: Enum.map(range, &{:set, prefix <> String.pad_leading(Integer.to_string(&1), 4, "0"), "v"})
+
+  defp live_page_ids(%{versions: [{_version, {index, _modified}} | _]}), do: index.page_map |> Map.keys() |> Enum.sort()
+
   describe "rollback_to/2" do
     test "discards in-memory versions above the target — a pointer operation" do
       db = create_test_database()
@@ -90,6 +96,62 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManagerTest do
       rolled = IndexManager.rollback_to(im, Version.from_integer(2_000))
 
       assert rolled.current_version == v1
+    end
+
+    # The resumed stream re-delivers the discarded suffix, so a count that
+    # did not rewind with the index would tally those transactions twice.
+    test "the key count rewinds with the index" do
+      db = create_test_database()
+      im = IndexManager.new()
+
+      v1 = Version.from_integer(1_000)
+      v2 = Version.from_integer(2_000)
+
+      {im, db} = IndexManager.apply_transactions(im, [test_transaction([{:set, "a", "1"}], v1)], db)
+      {im, _db} = IndexManager.apply_transactions(im, [test_transaction([{:set, "b", "2"}, {:set, "c", "3"}], v2)], db)
+      assert IndexManager.info(im, :n_keys) == 3
+
+      rolled = IndexManager.rollback_to(im, v1)
+
+      assert IndexManager.info(rolled, :n_keys) == 1
+      assert IndexManager.info(rolled, :key_ranges) == [{"a", "a"}]
+    end
+
+    # A clear above the rollback point empties pages and recycles their ids.
+    # The rollback brings those pages back to life, so an allocator carried
+    # across would still list a live page's id as free — and the next split
+    # would take it and write a new page straight over the live one.
+    test "the id allocator rewinds with the index" do
+      db = create_test_database()
+      im = IndexManager.new()
+
+      v1 = Version.from_integer(1_000)
+      v2 = Version.from_integer(2_000)
+      v3 = Version.from_integer(3_000)
+
+      # 300 keys overflow the 256-key page, splitting page 0 and allocating
+      # a second page id.
+      {im, db} = IndexManager.apply_transactions(im, [test_transaction(sets("k", 1..300), v1)], db)
+      page_ids_at_v1 = live_page_ids(im)
+      assert page_ids_at_v1 == [0, 1]
+
+      # Empty page 1 above the rollback point: its id goes on the free list.
+      {im, db} = IndexManager.apply_transactions(im, [test_transaction([{:clear_range, "k0151", "l"}], v2)], db)
+      assert live_page_ids(im) == [0]
+      assert IndexManager.info(im, :free_ids) == [1]
+
+      rolled = IndexManager.rollback_to(im, v1)
+
+      assert live_page_ids(rolled) == page_ids_at_v1
+      assert IndexManager.info(rolled, :free_ids) == []
+
+      # 120 more keys below the page boundary overflow page 0 again, so the
+      # replayed suffix asks the allocator for another id.
+      {rolled, _db} = IndexManager.apply_transactions(rolled, [test_transaction(sets("j", 1..120), v3)], db)
+
+      [{^v3, {index, _}} | _] = rolled.versions
+      assert IndexManager.info(rolled, :n_keys) == Index.key_count(index)
+      assert IndexManager.info(rolled, :n_keys) == 420
     end
 
     test "a rollback at or above the current version is a no-op" do
@@ -159,31 +221,119 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManagerTest do
     end
 
     test "info/2 returns key_ranges with real data after transactions" do
-      # Create a database and apply transactions to get real min/max keys
       database = create_test_database()
 
       try do
-        # Create transaction with keys spanning from "apple" to "zebra"
-        mutations = [
-          {:set, <<"apple">>, <<"value1">>},
-          {:set, <<"zebra">>, <<"value2">>}
-        ]
-
-        transaction = test_transaction(mutations, Version.from_integer(1000))
-
-        # Apply transaction and check key ranges
         index_manager = IndexManager.new()
-        {updated_manager, _database} = IndexManager.apply_transaction(index_manager, transaction, database)
 
-        key_ranges = IndexManager.info(updated_manager, :key_ranges)
-        assert [{min_key, max_key}] = key_ranges
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:set, "apple", "v1"}, {:set, "zebra", "v2"}], Version.from_integer(1000)),
+            database
+          )
 
-        # Note: Currently the Index doesn't update min/max keys during mutations
-        # This returns the initial empty values. This could be improved in the future.
-        # Initial empty min_key
-        assert min_key == <<0xFF, 0xFF>>
-        # Initial empty max_key
-        assert max_key == <<>>
+        assert [{"apple", "zebra"}] = IndexManager.info(index_manager, :key_ranges)
+
+        # The bounds follow the data: a key outside them widens the range...
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:set, "aardvark", "v3"}], Version.from_integer(2000)),
+            database
+          )
+
+        assert [{"aardvark", "zebra"}] = IndexManager.info(index_manager, :key_ranges)
+
+        # ...and clearing the extremes narrows it back.
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:clear, "aardvark"}, {:clear, "zebra"}], Version.from_integer(3000)),
+            database
+          )
+
+        assert [{"apple", "apple"}] = IndexManager.info(index_manager, :key_ranges)
+
+        # An index emptied of its keys reports the empty-range sentinel again
+        {index_manager, _database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:clear, "apple"}], Version.from_integer(4000)),
+            database
+          )
+
+        assert [{<<0xFF, 0xFF>>, <<>>}] = IndexManager.info(index_manager, :key_ranges)
+      after
+        Database.close(database)
+      end
+    end
+
+    test "info/2 tracks n_keys across sets, clears and range clears" do
+      database = create_test_database()
+
+      try do
+        index_manager = IndexManager.new()
+        assert IndexManager.info(index_manager, :n_keys) == 0
+
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:set, "a", "1"}, {:set, "b", "2"}, {:set, "c", "3"}], Version.from_integer(1000)),
+            database
+          )
+
+        assert IndexManager.info(index_manager, :n_keys) == 3
+
+        # Overwriting an existing key is not a new key; clearing a key that
+        # was never there is not a removal.
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:set, "a", "1-again"}, {:clear, "zzz"}], Version.from_integer(2000)),
+            database
+          )
+
+        assert IndexManager.info(index_manager, :n_keys) == 3
+
+        {index_manager, database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:clear, "b"}], Version.from_integer(3000)),
+            database
+          )
+
+        assert IndexManager.info(index_manager, :n_keys) == 2
+
+        # A range clear over everything that is left lands on zero — never
+        # below it, which is what double-counted removals used to produce.
+        {index_manager, _database} =
+          IndexManager.apply_transaction(
+            index_manager,
+            test_transaction([{:clear_range, "", "zz"}], Version.from_integer(4000)),
+            database
+          )
+
+        assert IndexManager.info(index_manager, :n_keys) == 0
+      after
+        Database.close(database)
+      end
+    end
+
+    test "n_keys counts keys, not pages, once a transaction splits a page" do
+      database = create_test_database()
+
+      try do
+        mutations = for i <- 1..600, do: {:set, "key#{String.pad_leading(to_string(i), 4, "0")}", "v"}
+
+        {index_manager, _database} =
+          IndexManager.apply_transaction(
+            IndexManager.new(),
+            test_transaction(mutations, Version.from_integer(1000)),
+            database
+          )
+
+        assert IndexManager.info(index_manager, :n_keys) == 600
       after
         Database.close(database)
       end
